@@ -45,6 +45,7 @@ type Record struct {
 	Priority int
 	Status   string
 	RecordID string
+	TrackIP  bool // 1 = this A record follows the home public IP
 }
 
 // HomeRecord is a DNS record joined with its zone's Cloudflare zone ID,
@@ -158,29 +159,32 @@ func (s *Store) ListZones(ctx context.Context) (map[string]Zone, error) {
 	return out, rows.Err()
 }
 
-// ListZonesForIP returns active zone rows with a non-empty zone ID and DNS
-// records (mirror of the old dnsRecords view), used by update-ip.
-func (s *Store) ListHomeARecords(ctx context.Context, content string) ([]HomeRecord, error) {
+// ListTrackedARecords returns A records flagged track_ip=1 in active zones
+// with a stable Cloudflare identity. update-ip compares each record's content
+// against the detected public IP straight from this mirror, so an unchanged
+// run never touches the Cloudflare API.
+func (s *Store) ListTrackedARecords(ctx context.Context) ([]HomeRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT d.dnsid, d.domain_id, d.type, d.name, d.content, d.proxied,
-		       d.ttl, d.priority, d.status, d.recordid, dm.zoneid
+		       d.ttl, d.priority, d.status, d.recordid, d.track_ip, dm.zoneid
 		FROM dns d JOIN domain dm ON dm.domainID = d.domain_id
 		WHERE d.type = 'A' AND d.status = 'on' AND dm.status = 'on'
-		  AND dm.zoneid <> '' AND d.recordid <> '' AND d.content = ?`, content)
+		  AND dm.zoneid <> '' AND d.recordid <> '' AND d.track_ip = 1`)
 	if err != nil {
-		return nil, fmt.Errorf("list home A records: %w", err)
+		return nil, fmt.Errorf("list tracked A records: %w", err)
 	}
 	defer rows.Close()
 	var out []HomeRecord
 	for rows.Next() {
 		var r HomeRecord
-		var proxied int
+		var proxied, track int
 		var ttl sql.NullInt64
 		if err := rows.Scan(&r.ID, &r.DomainID, &r.Type, &r.Name, &r.Content,
-			&proxied, &ttl, &r.Priority, &r.Status, &r.RecordID, &r.ZoneID); err != nil {
-			return nil, fmt.Errorf("scan home record: %w", err)
+			&proxied, &ttl, &r.Priority, &r.Status, &r.RecordID, &track, &r.ZoneID); err != nil {
+			return nil, fmt.Errorf("scan tracked record: %w", err)
 		}
 		r.Proxied = proxied != 0
+		r.TrackIP = track != 0
 		if ttl.Valid {
 			r.TTL = int(ttl.Int64)
 		}
@@ -237,7 +241,7 @@ func (s *Store) SetZoneStatus(ctx context.Context, domainID int64, status string
 // ListRecords returns all records of a domain.
 func (s *Store) ListRecords(ctx context.Context, domainID int64) ([]Record, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT dnsid, domain_id, type, name, content, proxied, ttl, priority, status, recordid
+		SELECT dnsid, domain_id, type, name, content, proxied, ttl, priority, status, recordid, track_ip
 		FROM dns WHERE domain_id = ?`, domainID)
 	if err != nil {
 		return nil, fmt.Errorf("list records domain %d: %w", domainID, err)
@@ -246,13 +250,14 @@ func (s *Store) ListRecords(ctx context.Context, domainID int64) ([]Record, erro
 	var out []Record
 	for rows.Next() {
 		var r Record
-		var proxied int
+		var proxied, track int
 		var ttl sql.NullInt64
 		if err := rows.Scan(&r.ID, &r.DomainID, &r.Type, &r.Name, &r.Content,
-			&proxied, &ttl, &r.Priority, &r.Status, &r.RecordID); err != nil {
+			&proxied, &ttl, &r.Priority, &r.Status, &r.RecordID, &track); err != nil {
 			return nil, fmt.Errorf("scan record: %w", err)
 		}
 		r.Proxied = proxied != 0
+		r.TrackIP = track != 0
 		if ttl.Valid {
 			r.TTL = int(ttl.Int64)
 		}
@@ -307,6 +312,72 @@ func (s *Store) UpdateRecordContent(ctx context.Context, dnsID int64, content st
 		return fmt.Errorf("update record content %d: %w", dnsID, err)
 	}
 	return nil
+}
+
+// SetRecordTrack marks a single record as following (or not following) the
+// home public IP.
+func (s *Store) SetRecordTrack(ctx context.Context, dnsID int64, track bool) error {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE dns SET track_ip = ? WHERE dnsid = ?`, boolToInt(track), dnsID); err != nil {
+		return fmt.Errorf("set record track %d: %w", dnsID, err)
+	}
+	return nil
+}
+
+// SetZoneTrackARecords flips the home-IP flag on every A record of a domain
+// and returns how many rows were touched.
+func (s *Store) SetZoneTrackARecords(ctx context.Context, domainID int64, track bool) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE dns SET track_ip = ? WHERE domain_id = ? AND type = 'A'`, boolToInt(track), domainID)
+	if err != nil {
+		return 0, fmt.Errorf("set zone track domain %d: %w", domainID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("set zone track domain %d rows: %w", domainID, err)
+	}
+	return n, nil
+}
+
+// FindRecordByName returns the mirror row for a host name (FQDN) in a domain.
+func (s *Store) FindRecordByName(ctx context.Context, domainID int64, name string) (Record, bool, error) {
+	var r Record
+	var proxied, track int
+	var ttl sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT dnsid, domain_id, type, name, content, proxied, ttl, priority, status, recordid, track_ip
+		FROM dns WHERE domain_id = ? AND LOWER(name) = LOWER(?)`, domainID, name).
+		Scan(&r.ID, &r.DomainID, &r.Type, &r.Name, &r.Content, &proxied, &ttl,
+			&r.Priority, &r.Status, &r.RecordID, &track)
+	if err == sql.ErrNoRows {
+		return Record{}, false, nil
+	}
+	if err != nil {
+		return Record{}, false, fmt.Errorf("record by name %s domain %d: %w", name, domainID, err)
+	}
+	r.Proxied = proxied != 0
+	r.TrackIP = track != 0
+	if ttl.Valid {
+		r.TTL = int(ttl.Int64)
+	}
+	return r, true, nil
+}
+
+// ZoneByName finds a zone row by domain name.
+func (s *Store) ZoneByName(ctx context.Context, name string) (Zone, bool, error) {
+	var z Zone
+	// Collation is case-insensitive on utf8mb4_unicode_520_ci, matching how
+	// Cloudflare treats domain equality.
+	err := s.db.QueryRowContext(ctx,
+		`SELECT domainID, domainname, registrar, zoneid, status FROM domain WHERE domainname = ?`,
+		name).Scan(&z.ID, &z.Name, &z.Registrar, &z.ZoneID, &z.Status)
+	if err == sql.ErrNoRows {
+		return Zone{}, false, nil
+	}
+	if err != nil {
+		return Zone{}, false, fmt.Errorf("zone by name %s: %w", name, err)
+	}
+	return z, true, nil
 }
 
 // --- app state ---

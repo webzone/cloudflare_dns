@@ -19,12 +19,50 @@ deploy/              systemd units + env example
 migrations embedded  internal/store/migrations/
 ```
 
-## Commands
-
+cfddns [--dry-run] init <zone> [--wildcard]
+                                        create/mirror base A records (@ and www)
+                                        at the home IP; --wildcard adds *
+cfddns track <zone> [name] on|off       mark A record(s) as following (on) or
+                                        not following (off) the home IP; name is
+                                        @, *, www or any FQDN (no name = zone-wide)
+cfddns [--dry-run] purge [zone]         purge edge cache (all or one zone)
+cfddns inspect zones                    list Cloudflare zones
+cfddns inspect records <zone>           list a zone's records (with track=…)
 ```
-cfddns [--dry-run] sync                 mirror Cloudflare zones/records into the DB
-cfddns [--dry-run] update-ip            A records tracking the home IP:
-                                        Cloudflare first, mirror after success
+
+`--dry-run` (or env `CF_DDNS_DRY_RUN=1`) logs every planned change and writes
+nothing — run it before any real run.
+
+## Semantics
+
+- **`sync`**: lists all zones/records from Cloudflare and upserts the mirror
+  keyed by Cloudflare record ID. Zones/records absent from Cloudflare are
+  marked `status='off'` (never deleted; hard deletion is a manual choice).
+  Record names are stored as FQDNs exactly as Cloudflare returns them.
+  TTL 1 = "automatic".
+- **`track` flag** (`dns.track_ip`, default 0): the distinction between
+  records this box owns and records that must never be touched. `update-ip`
+  only ever considers A records with `track=1`. `sync` never flips the flag.
+  A new zone's records are flagged by `init`; anything else (e.g.
+  `changchun.51email.com`, which resolves to another server) stays `off` and
+  will never be rewritten to the home IP.
+- **`update-ip`**: detects the public IP **once** per run from 3 independent
+  HTTPS sources (two must agree, else the run is skipped). When the IP is
+  unchanged it exits immediately — **zero Cloudflare API calls**. On a
+  change it compares every `track=1` record straight against the local mirror
+  (records already at the new IP are skipped), updates **Cloudflare first**,
+  and only after each success writes the mirror. `last_known_ip` in
+  `app_state` only advances when every differing record succeeded, so
+  failures retry next run.
+- **`init <zone>`**: for a domain just added to Cloudflare — detects the
+  public IP once, creates/updates the base A records (`@`, `www`, and `*`
+  with `--wildcard`) proxied with auto TTL, mirrors them and flags exactly
+  those records tracked, then seeds `last_known_ip`. Idempotent; safe to
+  re-run.
+- **`purge`**: purges all cached content for one zone or every active zone.
+- Migrations (embedded SQL) run automatically at startup; each file is
+  recorded in `schema_migrations` and applied at most once. MariaDB-only
+  syntax (`IF NOT EXISTS`); the target DB is MariaDB 10.11.
 cfddns [--dry-run] purge [zone]         purge edge cache (all or one zone)
 cfddns inspect zones                    list Cloudflare zones
 cfddns inspect records <zone>           list a zone's records

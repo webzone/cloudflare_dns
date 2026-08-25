@@ -111,6 +111,33 @@ func (c *Client) UpdateARecord(ctx context.Context, r Record, content string) er
 	return nil
 }
 
+// CreateARecord adds a new A record (proxied, auto TTL by default) and
+// returns the created record including its Cloudflare ID.
+func (c *Client) CreateARecord(ctx context.Context, zoneID, name, content string, proxied bool, ttl int) (Record, error) {
+	res, err := c.api.DNS.Records.New(ctx, dns.RecordNewParams{
+		ZoneID: cloudflare.F(zoneID),
+		Body: dns.ARecordParam{
+			Name:    cloudflare.F(name),
+			TTL:     cloudflare.F(dns.TTL(ttl)),
+			Type:    cloudflare.F(dns.ARecordType("A")),
+			Content: cloudflare.F(content),
+			Proxied: cloudflare.F(proxied),
+		},
+	})
+	if err != nil {
+		return Record{}, fmt.Errorf("create A record %s in zone %s: %w", name, zoneID, err)
+	}
+	return Record{
+		ID:      res.ID,
+		ZoneID:  zoneID,
+		Type:    "A",
+		Name:    res.Name,
+		Content: res.Content,
+		Proxied: res.Proxied,
+		TTL:     int(res.TTL),
+	}, nil
+}
+
 // PurgeCache purges all cached content for a zone.
 func (c *Client) PurgeCache(ctx context.Context, zoneID string) error {
 	_, err := c.api.Cache.Purge(ctx, cache.CachePurgeParams{

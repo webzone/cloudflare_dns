@@ -38,14 +38,25 @@ COMMANDS
   sync                 Mirror Cloudflare zones/records into the local DB
                        (Cloudflare is the single source of truth)
   update-ip            Update A records tracking the home public IP:
-                       Cloudflare first, then the local mirror
+                       Cloudflare first, then the local mirror. Records are
+                       compared against the mirror (no Cloudflare calls when
+                       nothing changed); only records flagged track=on move
+  init <zone>          Initialize a new zone on Cloudflare: create/mirror the
+                       base A records (@ and www) at the current public IP and
+                       flag them for update-ip (--wildcard adds *)
+  track <zone> [name]  Mark A record(s) of a zone as following the home IP:
+                         track example.com on|off        (whole zone)
+                         track example.com www on|off    (one record; name
+                                                          can be @, * or FQDN)
   purge [zone]         Purge edge cache of one zone or all mirrored zones
   inspect zones        List Cloudflare zones
-  inspect records <z>  List DNS records of one Cloudflare zone
+  inspect records <z>  List DNS records of one zone (combined with the
+                       mirror, so the track column is visible)
   help                 Show this help
 
 GLOBAL
   --dry-run            Log planned changes without applying them
+  --wildcard           init: also create the * wildcard A record
   Config comes from the environment (see README.md)
   Migrations run automatically on startup
 `
@@ -53,10 +64,15 @@ GLOBAL
 // Run dispatches a subcommand.
 func (a *App) Run(ctx context.Context, args []string) error {
 	dryRun := a.cfg.DryRun
+	wildcard := false
 	rest := make([]string, 0, len(args))
 	for _, arg := range args {
-		if arg == "--dry-run" || arg == "-n" {
+		switch arg {
+		case "--dry-run", "-n":
 			dryRun = true
+			continue
+		case "--wildcard":
+			wildcard = true
 			continue
 		}
 		rest = append(rest, arg)
@@ -71,6 +87,13 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runSync(ctx, dryRun)
 	case "update-ip":
 		return a.runUpdateIP(ctx, dryRun)
+	case "init":
+		if len(rest) < 2 {
+			return errors.New("usage: cfddns init <zone> [--wildcard]")
+		}
+		return a.runInit(ctx, rest[1], wildcard, dryRun)
+	case "track":
+		return a.runTrack(ctx, rest[1:], dryRun)
 	case "purge":
 		zone := ""
 		if len(rest) > 1 {
@@ -130,18 +153,79 @@ func (a *App) runUpdateIP(ctx context.Context, dryRun bool) error {
 	return service.NewUpdater(client, st, a.log, service.IPDetector(a.detectIP), dryRun).Run(ctx)
 }
 
-// detectIP returns the network-detected public IP unless the test-only env
-// override CF_DDNS_TEST_IP is set (used with --dry-run to exercise the IP
-// change path without a real IP change).
-func (a *App) detectIP(ctx context.Context) (netip.Addr, error) {
-	if t := os.Getenv("CF_DDNS_TEST_IP"); t != "" {
-		addr, err := netip.ParseAddr(t)
-		if err != nil || !addr.Is4() {
-			return netip.Addr{}, fmt.Errorf("invalid CF_DDNS_TEST_IP %q", t)
-		}
-		return addr, nil
+func (a *App) runInit(ctx context.Context, zone string, wildcard, dryRun bool) error {
+	client, st, closeFn, err := a.open(ctx)
+	if err != nil {
+		return err
 	}
-	return ip.Detect(ctx)
+	defer closeFn()
+	return service.NewInitiator(client, st, a.log, service.IPDetector(a.detectIP), dryRun).Run(ctx, zone, wildcard)
+}
+
+func (a *App) runTrack(ctx context.Context, args []string, dryRun bool) error {
+	if len(args) < 2 || len(args) > 3 {
+		return errors.New("usage: cfddns track <zone> [name] on|off")
+	}
+	zone := args[0]
+	onOff := args[len(args)-1]
+	var track bool
+	switch onOff {
+	case "on":
+		track = true
+	case "off":
+		track = false
+	default:
+		return fmt.Errorf(`track flag must be "on" or "off", got %q`, onOff)
+	}
+	name := ""
+	if len(args) == 3 {
+		name = args[1]
+	}
+
+	_, st, closeFn, err := a.open(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeFn()
+
+	dz, ok, err := st.ZoneByName(ctx, zone)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("zone %q not in the mirror; run `cfddns sync` first", zone)
+	}
+
+	if name == "" {
+		if dryRun {
+			fmt.Printf("would set track=%v on all A records of %s\n", track, zone)
+			return nil
+		}
+		n, err := st.SetZoneTrackARecords(ctx, dz.ID, track)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("track=%v on %d A records of %s\n", track, n, zone)
+		return nil
+	}
+
+	target := service.FQDNHost(name, zone)
+	rec, ok, err := st.FindRecordByName(ctx, dz.ID, target)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("no A record %q in zone %s", target, zone)
+	}
+	if dryRun {
+		fmt.Printf("would set track=%v on %s (%s)\n", track, target, rec.Content)
+		return nil
+	}
+	if err := st.SetRecordTrack(ctx, rec.ID, track); err != nil {
+		return err
+	}
+	fmt.Printf("track=%v on %s (%s)\n", track, target, rec.Content)
+	return nil
 }
 
 func (a *App) runPurge(ctx context.Context, zone string, dryRun bool) error {
@@ -174,6 +258,14 @@ func (a *App) runInspect(ctx context.Context, args []string) error {
 	if len(args) < 2 {
 		return errors.New("inspect records needs a zone name")
 	}
+
+	// The records view needs the mirror for the track column.
+	client, st, closeFn, err := a.open(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeFn()
+
 	zones, err := client.ListZones(ctx)
 	if err != nil {
 		return err
@@ -192,14 +284,48 @@ func (a *App) runInspect(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// Overlay the mirror's track flags so operators can see which records
+	// update-ip owns (records not mirrored yet show "-").
+	track := map[string]bool{}
+	if dz, ok, err := st.ZoneByName(ctx, args[1]); err == nil && ok {
+		if drecs, err := st.ListRecords(ctx, dz.ID); err == nil {
+			for _, dr := range drecs {
+				if dr.RecordID != "" {
+					track[dr.RecordID] = dr.TrackIP
+				}
+			}
+		}
+	}
 	for _, r := range recs {
 		proxied := "-"
 		if r.Proxied {
 			proxied = "proxied"
 		}
-		fmt.Printf("%s\t%s\t%s\t%d\t%s\n", r.Type, r.Name, r.Content, r.TTL, proxied)
+		tv := "-"
+		if v, ok := track[r.ID]; ok {
+			tv = "off"
+			if v {
+				tv = "on"
+			}
+		}
+		fmt.Printf("%s\t%s\t%s\t%d\t%s\ttrack=%s\n", r.Type, r.Name, r.Content, r.TTL, proxied, tv)
 	}
 	return nil
+}
+
+// detectIP returns the network-detected public IP unless the test-only env
+// override CF_DDNS_TEST_IP is set (used with --dry-run to exercise the IP
+// change path without a real IP change).
+func (a *App) detectIP(ctx context.Context) (netip.Addr, error) {
+	if t := os.Getenv("CF_DDNS_TEST_IP"); t != "" {
+		addr, err := netip.ParseAddr(t)
+		if err != nil || !addr.Is4() {
+			return netip.Addr{}, fmt.Errorf("invalid CF_DDNS_TEST_IP %q", t)
+		}
+		return addr, nil
+	}
+	return ip.Detect(ctx)
 }
 
 func cfOnly(ctx context.Context, cfg *config.Config) (*cf.Client, error) {

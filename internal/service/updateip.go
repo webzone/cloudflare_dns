@@ -30,9 +30,25 @@ func NewUpdater(c *cf.Client, s *store.Store, log *slog.Logger, detect IPDetecto
 	return &Updater{cf: c, st: s, log: log, detect: detect, dryRun: dryRun, autoTTL: 1}
 }
 
-// Run performs one update-ip pass. It is conservative: no record is touched
-// on Cloudflare unless a fresh, multi-source IP was detected, and the mirror
-// only follows a Cloudflare write that already succeeded.
+// splitTracked separates tracked mirror records into those already holding
+// the detected IP (skipped — no Cloudflare call needed) and those that differ
+// and therefore need a Cloudflare write.
+func splitTracked(recs []store.HomeRecord, ip string) (pending []store.HomeRecord, skipped int) {
+	for _, r := range recs {
+		if r.Content == ip {
+			skipped++
+			continue
+		}
+		pending = append(pending, r)
+	}
+	return pending, skipped
+}
+
+// Run performs one update-ip pass. The public IP is detected once; records
+// flagged track_ip=1 are compared against that single value straight from the
+// local mirror (Cloudflare is not consulted when nothing changed): identical
+// records are skipped, Cloudflare is only written for records that differ,
+// and the mirror follows each Cloudflare write only after it succeeded.
 func (u *Updater) Run(ctx context.Context) error {
 	addr, err := u.detect(ctx)
 	if err != nil {
@@ -57,13 +73,17 @@ func (u *Updater) Run(ctx context.Context) error {
 		return nil
 	}
 
-	recs, err := u.st.ListHomeARecords(ctx, last)
+	recs, err := u.st.ListTrackedARecords(ctx)
 	if err != nil {
 		return err
 	}
-	if len(recs) == 0 {
-		u.log.Info("no mirror records tracked the previous IP; adopting new state",
-			"from", last, "to", ip)
+
+	// Compare every tracked record's mirror content against the detected
+	// IP once. Records already pointing at it need no Cloudflare call.
+	pending, _ := splitTracked(recs, ip)
+	if len(pending) == 0 {
+		u.log.Info("all tracked records already at the detected IP; adopting new state",
+			"from", last, "to", ip, "tracked", len(recs))
 		if u.dryRun {
 			return nil
 		}
@@ -71,7 +91,7 @@ func (u *Updater) Run(ctx context.Context) error {
 	}
 
 	updated, failed := 0, 0
-	for _, r := range recs {
+	for _, r := range pending {
 		ttl := r.TTL
 		if ttl <= 0 {
 			ttl = u.autoTTL
@@ -102,10 +122,10 @@ func (u *Updater) Run(ctx context.Context) error {
 	}
 
 	u.log.Info("IP update finished", "updated", updated, "failed", failed,
-		"total", len(recs), "dry_run", u.dryRun)
+		"skipped", len(recs)-len(pending), "total", len(recs), "dry_run", u.dryRun)
 	if failed > 0 {
 		// Keep last_known_ip at the old value so failed records retry next run.
-		return fmt.Errorf("%d of %d records updated", updated, len(recs))
+		return fmt.Errorf("%d of %d records updated", updated, len(pending))
 	}
 	if u.dryRun {
 		return nil
