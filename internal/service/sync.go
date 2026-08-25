@@ -24,17 +24,21 @@ type Result struct {
 	RecordsDisabled  int
 }
 
-// Sync mirrors Cloudflare state into the local store.
+// Sync mirrors Cloudflare state into the local store and, for managed zones
+// (present on Cloudflare), guarantees the standard @/www/* A records exist at
+// the home IP.
 type Sync struct {
 	cf     *cf.Client
 	st     *store.Store
 	log    *slog.Logger
 	dryRun bool
+	detect IPDetector // home-IP probe for base-record auto-completion
 }
 
-// NewSync builds a sync runner.
-func NewSync(c *cf.Client, s *store.Store, log *slog.Logger, dryRun bool) *Sync {
-	return &Sync{cf: c, st: s, log: log, dryRun: dryRun}
+// NewSync builds a sync runner. detect is optional (nil disables base A
+// auto-completion).
+func NewSync(c *cf.Client, s *store.Store, log *slog.Logger, detect IPDetector, dryRun bool) *Sync {
+	return &Sync{cf: c, st: s, log: log, dryRun: dryRun, detect: detect}
 }
 
 // Run lists all Cloudflare zones and records, diffs against the mirror, and
@@ -154,13 +158,25 @@ func (s *Sync) syncZone(ctx context.Context, z cf.Zone, dbZones map[string]store
 		}
 	}
 
-	return s.syncRecords(ctx, z, domainID, res)
+	// managed: every zone present on Cloudflare is under this program's
+	// management this run — flag it as such for base-record completion and
+	// track-on-insert (mirror rows of managed domains default to track=1).
+	managed := s.dryRun || dz.Registrar == "cloudflare" || !hasID
+	return s.syncRecords(ctx, z, domainID, managed, res)
 }
 
-func (s *Sync) syncRecords(ctx context.Context, z cf.Zone, domainID int64, res *Result) error {
+func (s *Sync) syncRecords(ctx context.Context, z cf.Zone, domainID int64, managed bool, res *Result) error {
 	cfRecs, err := s.cf.ListRecords(ctx, z.ID)
 	if err != nil {
 		return err
+	}
+	if managed && s.detect != nil {
+		created, err := s.ensureBaseARecords(ctx, z, cfRecs)
+		if err != nil {
+			s.log.Warn("base A record completion skipped", "zone", z.Name, "err", err)
+		} else if len(created) > 0 {
+			cfRecs = append(cfRecs, created...)
+		}
 	}
 	if domainID == newZoneDomainID {
 		// Zone would be new under dry-run; no mirror rows exist to diff.
@@ -215,8 +231,16 @@ func (s *Sync) syncRecords(ctx context.Context, z cf.Zone, domainID int64, res *
 		s.logAction("record", "add", recordDesc(z.Name, rec))
 		res.RecordsAdded++
 		if !s.dryRun {
-			if _, err := s.st.InsertRecord(ctx, domainID, rec); err != nil {
+			dnsID, err := s.st.InsertRecord(ctx, domainID, rec)
+			if err != nil {
 				return err
+			}
+			if managed {
+				// Default for managed domains: the new record follows the
+				// home IP unless explicitly untracked later.
+				if err := s.st.SetRecordTrack(ctx, dnsID, true); err != nil {
+					return err
+				}
 			}
 		}
 	}

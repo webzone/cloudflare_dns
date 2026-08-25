@@ -10,10 +10,6 @@ import (
 	"github.com/webzone/cloudflare_dns/internal/store"
 )
 
-// baseLabels are the A records init guarantees on a new zone: apex and www,
-// plus the optional wildcard.
-var baseLabels = []string{"@", "www"}
-
 // Initiator sets up DNS for a zone added to Cloudflare. It detects the public
 // IP once, ensures the base A records point at it on Cloudflare (updating or
 // creating as needed), mirrors them locally and flags them track_ip=1 so
@@ -63,9 +59,9 @@ func (i *Initiator) Run(ctx context.Context, zoneName string, wildcard bool) err
 		allByName[strings.ToLower(strings.TrimSuffix(r.Name, "."))] = r
 	}
 
-	labels := baseLabels
+	labels := baseLabels[:2]
 	if wildcard {
-		labels = append(labels, "*")
+		labels = baseLabels
 	}
 
 	type cell struct {
@@ -194,19 +190,4 @@ func (i *Initiator) Run(ctx context.Context, zoneName string, wildcard bool) err
 	i.log.Info("init complete", "zone", zoneName, "ip", ip,
 		"created", created, "updated", updated, "skipped", skipped, "mirrored", mirrored)
 	return nil
-}
-
-// FQDNHost resolves a DNS label to the FQDN Cloudflare expects. A fully
-// qualified input (contains a dot) is returned as-is.
-func FQDNHost(label, zone string) string {
-	switch label {
-	case "@":
-		return zone
-	case "*":
-		return "*." + zone
-	}
-	if strings.Contains(label, ".") {
-		return strings.TrimSuffix(label, ".")
-	}
-	return label + "." + zone
 }

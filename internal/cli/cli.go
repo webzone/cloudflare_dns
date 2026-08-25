@@ -140,7 +140,7 @@ func (a *App) runSync(ctx context.Context, dryRun bool) error {
 		return err
 	}
 	defer closeFn()
-	_, err = service.NewSync(client, st, a.log, dryRun).Run(ctx)
+	_, err = service.NewSync(client, st, a.log, service.IPDetector(a.detectIP), dryRun).Run(ctx)
 	return err
 }
 
