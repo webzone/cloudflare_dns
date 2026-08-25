@@ -70,13 +70,16 @@ nothing — run it before any real run.
   pointing at the current home IP (proxied, auto TTL). Existing records at
   those names — whatever they point at — are never touched by sync.
 - **`update-ip`** — detects the public IP **once** per run from 3 independent
-  HTTPS sources (two must agree, else the run is skipped). Unchanged IP →
-  immediate exit with **zero Cloudflare API calls**. On a change it compares
-  every `track=1` record (already filtered to `registrar='cloudflare'`
-  domains) straight against the local mirror, skips records already at the new
-  IP, updates **Cloudflare first**, and only after each success writes the
-  mirror. `last_known_ip` in `app_state` only advances when every differing
-  record succeeded, so failures retry next run.
+  HTTPS sources (two must agree, else the run is skipped), then reconciles the
+  zone set: a zone newly seen on Cloudflare is initialized (base `@`/`www`/`*`
+  records at the home IP, tracked, mirrored) and a managed zone that vanished
+  from Cloudflare is deregistered (`registrar` → `other`, `status` → `off`).
+  Unchanged IP → immediate exit with **zero remaining** Cloudflare API calls.
+  On a change it compares every `track=1` record (already filtered to
+  `registrar='cloudflare'` domains) straight against the local mirror, skips
+  records already at the new IP, updates **Cloudflare first**, and only after
+  each success writes the mirror. `last_known_ip` in `app_state` only advances
+  when every differing record succeeded, so failures retry next run.
 - **`init <zone>`** — for a domain just added to Cloudflare: detects the
   public IP once, creates/updates the base A records (`@`, `www`, and `*`
   with `--wildcard`) proxied with auto TTL, mirrors them and flags them

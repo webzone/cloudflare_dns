@@ -44,10 +44,77 @@ func splitTracked(recs []store.HomeRecord, ip string) (pending []store.HomeRecor
 	return pending, skipped
 }
 
-// Run performs one update-ip pass. The public IP is detected once; records
-// flagged track_ip=1 are compared against that single value straight from the
-// local mirror (Cloudflare is not consulted when nothing changed): identical
-// records are skipped, Cloudflare is only written for records that differ,
+// zoneDiff classifies the zone-set changes update-ip reconciles: zones on
+// Cloudflare not in the mirror (initialize them) and managed mirror zones
+// that vanished from Cloudflare (deregister: registrar -> other).
+func zoneDiff(cfZones []cf.Zone, dbZones map[string]store.Zone) (added []cf.Zone, removed []store.Zone) {
+	present := make(map[string]bool, len(cfZones))
+	for _, z := range cfZones {
+		present[z.ID] = true
+		if _, ok := dbZones[z.ID]; !ok {
+			added = append(added, z)
+		}
+	}
+	for _, dz := range dbZones {
+		if dz.Status != store.StatusOn || dz.Registrar != "cloudflare" {
+			continue
+		}
+		if !present[dz.ZoneID] {
+			removed = append(removed, dz)
+		}
+	}
+	return added, removed
+}
+
+// reconcileZones keeps the managed-zone set in step with Cloudflare: every
+// run it lists zones once, initializes newly seen zones (base @/www/* records
+// at the home IP, track=1, mirror) and deregisters managed zones that have
+// vanished from Cloudflare (registrar -> 'other', status -> off).
+func (u *Updater) reconcileZones(ctx context.Context, ip string) error {
+	cfZones, err := u.cf.ListZones(ctx)
+	if err != nil {
+		return fmt.Errorf("list cloudflare zones: %w", err)
+	}
+	dbZones, err := u.st.ListZones(ctx)
+	if err != nil {
+		return fmt.Errorf("list mirror zones: %w", err)
+	}
+	added, removed := zoneDiff(cfZones, dbZones)
+
+	for _, z := range added {
+		u.log.Info("new zone on Cloudflare; initializing base records",
+			"zone", z.Name, "zone_id", z.ID, "dry_run", u.dryRun)
+		if u.dryRun {
+			continue
+		}
+		detect := func(context.Context) (netip.Addr, error) { return netip.ParseAddr(ip) }
+		init := NewInitiator(u.cf, u.st, u.log, detect, u.dryRun)
+		if err := init.Run(ctx, z.Name, true); err != nil {
+			u.log.Error("zone initialization failed; retrying next run", "zone", z.Name, "err", err)
+			continue
+		}
+	}
+	for _, dz := range removed {
+		u.log.Info("zone vanished from Cloudflare; deregistering",
+			"zone", dz.Name, "dry_run", u.dryRun)
+		if u.dryRun {
+			continue
+		}
+		if err := u.st.SetZoneRegistrar(ctx, dz.ID, "other"); err != nil {
+			return err
+		}
+		if err := u.st.SetZoneStatus(ctx, dz.ID, store.StatusOff); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Run performs one update-ip pass. It first reconciles the zone set (new
+// zones on Cloudflare get initialized, managed zones that vanished are
+// deregistered), then compares every track_ip=1 record against the single
+// detected public IP straight from the mirror — unchanged IP exits with zero
+// Cloudflare API calls, Cloudflare is only written for records that differ,
 // and the mirror follows each Cloudflare write only after it succeeded.
 func (u *Updater) Run(ctx context.Context) error {
 	addr, err := u.detect(ctx)
@@ -56,6 +123,11 @@ func (u *Updater) Run(ctx context.Context) error {
 		return fmt.Errorf("skip run: %w", err)
 	}
 	ip := addr.String()
+
+	if err := u.reconcileZones(ctx, ip); err != nil {
+		// Zone changes must not block IP updates; retry next run.
+		u.log.Error("zone reconcile failed; will retry next run", "err", err)
+	}
 
 	last, known, err := u.st.GetState(ctx, store.StateKeyLastIP)
 	if err != nil {

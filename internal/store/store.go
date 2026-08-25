@@ -336,11 +336,13 @@ func (s *Store) SetRecordTrack(ctx context.Context, dnsID int64, track bool) err
 	return nil
 }
 
-// SetZoneTrackARecords flips the home-IP flag on every A record of a domain
-// and returns how many rows were touched.
+// SetZoneTrackARecords flips the home-IP flag on every active A record of a
+// domain (status='on' — off rows are disabled mirror history and are never
+// operated on) and returns how many rows were touched.
 func (s *Store) SetZoneTrackARecords(ctx context.Context, domainID int64, track bool) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE dns SET track_ip = ? WHERE domain_id = ? AND type = 'A'`, boolToInt(track), domainID)
+		`UPDATE dns SET track_ip = ? WHERE domain_id = ? AND type = 'A' AND status = 'on'`,
+		boolToInt(track), domainID)
 	if err != nil {
 		return 0, fmt.Errorf("set zone track domain %d: %w", domainID, err)
 	}
