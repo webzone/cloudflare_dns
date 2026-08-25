@@ -80,6 +80,8 @@ func (u *Updater) reconcileZones(ctx context.Context, ip string) error {
 		return fmt.Errorf("list mirror zones: %w", err)
 	}
 	added, removed := zoneDiff(cfZones, dbZones)
+	u.log.Info("zone reconcile", "zones", len(cfZones), "added", len(added),
+		"removed", len(removed), "dry_run", u.dryRun)
 
 	for _, z := range added {
 		u.log.Info("new zone on Cloudflare; initializing base records",
