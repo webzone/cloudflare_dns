@@ -55,18 +55,20 @@ ZONES (read-only view)
 DNS RECORDS
   dns <zone> [--type TYPE]    list records of a zone from the local DB, with
                               the track column (run sync first if stale)
-  dns add <zone> <TYPE> <name> <content> [--ttl N] [--proxy|--no-proxy] [--prio N]
+  dns add <zone> <TYPE> <name> [content] [--ttl N] [--proxy|--no-proxy] [--prio N]
                               create a record of type A/AAAA/CNAME/MX/TXT.
-                              A records of managed zones are tracked by default
+                              An A without content uses the current public
+                              IP and is tracked (follows home); an explicit
+                              IP is used verbatim, untracked
   dns update <zone> <name> [--content X] [--ttl N] [--proxy|--no-proxy] [--prio N]
                               change fields of an existing record; for
                               same-name dual records use the record id:
                               dns update <zone> <record-id> --content X
-  dns rm <zone> <name> [content] -y
-                              delete a record (Cloudflare + local
-                              soft-disable); an IP or the record id picks
-                              one of same-name dual records, otherwise an
-                              error lists the candidates
+  dns rm <zone> <name> [content] [--all] -y
+                              delete records (Cloudflare + local
+                              soft-disable); several same-name records list
+                              choices to pick from (Enter/1/a=all), or use
+                              --all, a content value, or the record id
 
 TOKEN
   token                       show token state (masked)
@@ -721,15 +723,33 @@ func (a *App) listZoneRecords(ctx context.Context, st *store.Store, dz store.Zon
 }
 
 func (a *App) dnsAdd(ctx context.Context, client *cf.Client, st *store.Store, dz store.Zone, args []string, o cmdOpts) error {
-	if len(args) != 3 {
-		return errors.New("usage: cfddns dns add <zone> <TYPE> <name> <content> [--ttl N] [--proxy|--no-proxy] [--prio N]")
+	if len(args) < 2 || len(args) > 3 {
+		return errors.New("usage: cfddns dns add <zone> <TYPE> <name> [content] [--ttl N] [--proxy|--no-proxy] [--prio N]")
 	}
 	typ := strings.ToUpper(args[0])
 	if !isSupportedType(typ) {
 		return fmt.Errorf("unsupported type %q (supported: %s)", typ, strings.Join(cf.SupportedRecordTypes(), ", "))
 	}
 	name := service.FQDNHost(args[1], dz.Name)
-	content := args[2]
+	content := ""
+	if len(args) == 3 {
+		content = args[2]
+	}
+
+	// An A record without an IP uses the current public IP and is tracked so
+	// it keeps following home; an explicit IP is taken verbatim, untracked.
+	useHome := false
+	if typ == "A" && content == "" {
+		addr, err := a.detectIP(ctx)
+		if err != nil {
+			return fmt.Errorf("no content given and the public IP could not be detected: %w\n(provide an IP, or run again when detection works)", err)
+		}
+		content = addr.String()
+		useHome = true
+	}
+	if content == "" {
+		return errors.New("missing content (only A records may omit it and use the current public IP)")
+	}
 
 	proxied := typ == "A" || typ == "AAAA" || typ == "CNAME"
 	switch {
@@ -748,17 +768,30 @@ func (a *App) dnsAdd(ctx context.Context, client *cf.Client, st *store.Store, dz
 	rec := cf.Record{ZoneID: dz.ZoneID, Type: typ, Name: name, Content: content,
 		Proxied: proxied, TTL: ttl, Priority: o.prio}
 
+	track := useHome // explicit-IP records do not follow the home IP
 	if o.dryRun {
-		fmt.Printf("would create %s %s %s (%s ttl=%d)%s\n", typ, name, content,
-			proxiedLabel(proxied), ttl, prioSuffix(o.prio))
+		fmt.Printf("would create %s %s %s (%s ttl=%d%s) track=%v\n", typ, name, content,
+			proxiedLabel(proxied), ttl, prioSuffix(o.prio), track)
 		return nil
 	}
 	created, err := client.CreateDNSRecord(ctx, dz.ZoneID, rec)
+	if err != nil && proxied && !o.proxy && !o.noProxy && strings.Contains(err.Error(), `"code":9003`) {
+		// Cloudflare refuses to proxy this target (e.g. a private IP):
+		// since proxy was only the default, fall back to direct.
+		rec.Proxied = false
+		proxied = false
+		created, err = client.CreateDNSRecord(ctx, dz.ZoneID, rec)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("note: %s cannot be proxied; created direct\n", content)
+	}
 	if err != nil {
 		return err
 	}
 
-	// Mirror the new record; A records of managed zones are tracked by default.
+	// Mirror the new record; A records of managed zones are tracked only when
+	// they follow the home IP (no explicit IP given).
 	mr := store.Record{
 		Type: created.Type, Name: created.Name, Content: created.Content,
 		Proxied: created.Proxied, TTL: created.TTL, Priority: created.Priority, RecordID: created.ID,
@@ -768,19 +801,22 @@ func (a *App) dnsAdd(ctx context.Context, client *cf.Client, st *store.Store, dz
 	}
 	managed := dz.Status == store.StatusOn && dz.Registrar == "cloudflare"
 	if managed && created.Type == "A" {
-		dr, ok, err := st.FindRecordByName(ctx, dz.ID, created.Name)
+		// Track the newly created record itself (by Cloudflare id), never
+		// "the first record at this name" — a dual-A name would otherwise
+		// get its existing record re-flagged instead of the new one.
+		dr, ok, err := st.FindRecordByCFID(ctx, dz.ID, created.ID)
 		if err != nil {
 			return err
 		}
 		if ok {
-			if err := st.SetRecordTrack(ctx, dr.ID, true); err != nil {
+			if err := st.SetRecordTrack(ctx, dr.ID, track); err != nil {
 				return err
 			}
 		}
 	}
 	fmt.Printf("created %s %s %s (record %s)\n", created.Type, created.Name, created.Content, created.ID)
 	if managed && created.Type == "A" {
-		fmt.Println("tracked: on")
+		fmt.Printf("tracked: %v\n", track)
 	}
 	return nil
 }
@@ -843,7 +879,7 @@ func (a *App) dnsUpdate(ctx context.Context, client *cf.Client, st *store.Store,
 
 func (a *App) dnsRm(ctx context.Context, client *cf.Client, st *store.Store, dz store.Zone, args []string, o cmdOpts) error {
 	if len(args) < 1 || len(args) > 2 {
-		return errors.New("usage: cfddns dns rm <zone> <name> [content] -y")
+		return errors.New("usage: cfddns dns rm <zone> <name> [content] [--all] -y")
 	}
 	if !o.yes {
 		return errors.New("this deletes a Cloudflare record; pass -y to confirm")
@@ -852,46 +888,95 @@ func (a *App) dnsRm(ctx context.Context, client *cf.Client, st *store.Store, dz 
 	if len(args) == 2 {
 		content = args[1]
 	}
-	dr, err := resolveRecord(ctx, st, dz, args[0], content)
+	cands, err := recordCandidates(ctx, st, dz, args[0], content)
 	if err != nil {
 		return err
 	}
-	if o.dryRun {
-		fmt.Printf("would delete %s %s (%s)\n", dr.Type, dr.Name, dr.Content)
-		return nil
+	selected := cands
+	if len(cands) > 1 {
+		switch {
+		case o.all:
+			// delete every record at the name
+		case isTTY():
+			selected, err = pickRecords(dz, cands)
+			if err != nil {
+				return err
+			}
+		default:
+			return ambiguousRecordsError(dz, cands, "pass a content value or --all")
+		}
 	}
-	if err := client.DeleteDNSRecord(ctx, dz.ZoneID, dr.RecordID); err != nil {
-		return err
+	for _, dr := range selected {
+		if o.dryRun {
+			fmt.Printf("would delete %s %s (%s)\n", dr.Type, dr.Name, dr.Content)
+			continue
+		}
+		if err := client.DeleteDNSRecord(ctx, dz.ZoneID, dr.RecordID); err != nil {
+			return err
+		}
+		if err := st.SetRecordStatus(ctx, dr.ID, store.StatusOff); err != nil {
+			return err
+		}
+		fmt.Printf("deleted %s %s (%s); local row soft-disabled\n", dr.Type, dr.Name, dr.Content)
 	}
-	if err := st.SetRecordStatus(ctx, dr.ID, store.StatusOff); err != nil {
-		return err
-	}
-	fmt.Printf("deleted %s %s (%s); local row soft-disabled\n", dr.Type, dr.Name, dr.Content)
 	return nil
 }
 
-// resolveRecord pins a single live mirror record from a Cloudflare record ID
-// (32-hex) or a host name. When the name carries several records, an optional
-// content value disambiguates; otherwise an error lists the candidates.
-func resolveRecord(ctx context.Context, st *store.Store, dz store.Zone, target, content string) (store.Record, error) {
+// pickRecords interactively asks which of several same-name records to
+// delete. Minimal typing: Enter picks the first, a digit picks one, 'a'
+// picks them all.
+func pickRecords(dz store.Zone, cands []store.Record) ([]store.Record, error) {
+	fmt.Printf("\n%d records at %q in %s:\n", len(cands), cands[0].Name, dz.Name)
+	for i, r := range cands {
+		tv := ""
+		if r.Type == "A" {
+			if r.TrackIP {
+				tv = " track=on"
+			} else {
+				tv = " track=off"
+			}
+		}
+		fmt.Printf("  %d) %-5s %-24s %s%s\n", i+1, r.Type, r.Content, r.RecordID, tv)
+	}
+	fmt.Print("delete which? Enter=1, or 'a' for all: ")
+	reader := bufio.NewReader(os.Stdin)
+	line, _ := reader.ReadString('\n')
+	choice := strings.TrimSpace(strings.ToLower(line))
+	switch choice {
+	case "", "1":
+		return cands[:1], nil
+	case "a", "all":
+		return cands, nil
+	}
+	n, err := strconv.Atoi(choice)
+	if err != nil || n < 1 || n > len(cands) {
+		return nil, fmt.Errorf("invalid choice %q (1-%d, Enter for 1, or a for all)", choice, len(cands))
+	}
+	return cands[n-1 : n], nil
+}
+
+// recordCandidates returns the live mirror records a rm/update target can
+// select among: a Cloudflare record id pins exactly one; otherwise every live
+// record at the name is returned, filtered by an optional content value.
+func recordCandidates(ctx context.Context, st *store.Store, dz store.Zone, target, content string) ([]store.Record, error) {
 	if isCFRecordID(target) {
 		rec, ok, err := st.FindRecordByCFID(ctx, dz.ID, target)
 		if err != nil {
-			return store.Record{}, err
+			return nil, err
 		}
 		if !ok {
-			return store.Record{}, fmt.Errorf("no record with id %q in zone %s", target, dz.Name)
+			return nil, fmt.Errorf("no record with id %q in zone %s", target, dz.Name)
 		}
 		if rec.Status != store.StatusOn {
-			return store.Record{}, fmt.Errorf("record %s is already disabled", target)
+			return nil, fmt.Errorf("record %s is already disabled", target)
 		}
-		return rec, nil
+		return []store.Record{rec}, nil
 	}
 
 	name := service.FQDNHost(target, dz.Name)
 	recs, err := st.RecordsByName(ctx, dz.ID, name)
 	if err != nil {
-		return store.Record{}, err
+		return nil, err
 	}
 	var live []store.Record
 	for _, r := range recs {
@@ -908,22 +993,38 @@ func resolveRecord(ctx context.Context, st *store.Store, dz store.Zone, target, 
 		}
 		live = filtered
 	}
-	switch len(live) {
-	case 0:
+	if len(live) == 0 {
 		if content != "" {
-			return store.Record{}, fmt.Errorf("no record %q with content %q in zone %s", name, content, dz.Name)
+			return nil, fmt.Errorf("no record %q with content %q in zone %s", name, content, dz.Name)
 		}
-		return store.Record{}, fmt.Errorf("no record %q in zone %s", name, dz.Name)
-	case 1:
-		return live[0], nil
-	default:
-		var cands []string
-		for _, r := range live {
-			cands = append(cands, fmt.Sprintf("%s (%s)", r.Content, r.RecordID))
-		}
-		return store.Record{}, fmt.Errorf("multiple records at %q in %s: %s — pass the record id or add the content to disambiguate",
-			name, dz.Name, strings.Join(cands, ", "))
+		return nil, fmt.Errorf("no record %q in zone %s", name, dz.Name)
 	}
+	return live, nil
+}
+
+// ambiguousRecordsError explains that several same-name records match and
+// how to pick one of them.
+func ambiguousRecordsError(dz store.Zone, cands []store.Record, hint string) error {
+	var desc []string
+	for _, r := range cands {
+		desc = append(desc, fmt.Sprintf("%s (%s)", r.Content, r.RecordID))
+	}
+	return fmt.Errorf("multiple records at %q in %s: %s — %s",
+		cands[0].Name, dz.Name, strings.Join(desc, ", "), hint)
+}
+
+// resolveRecord pins a single live mirror record from a Cloudflare record ID
+// (32-hex) or a host name. When the name carries several records, an optional
+// content value disambiguates; otherwise an error lists the candidates.
+func resolveRecord(ctx context.Context, st *store.Store, dz store.Zone, target, content string) (store.Record, error) {
+	cands, err := recordCandidates(ctx, st, dz, target, content)
+	if err != nil {
+		return store.Record{}, err
+	}
+	if len(cands) > 1 {
+		return store.Record{}, ambiguousRecordsError(dz, cands, "pass the record id or add the content to disambiguate")
+	}
+	return cands[0], nil
 }
 
 // isCFRecordID reports whether s looks like a Cloudflare record ID (32 hex).

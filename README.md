@@ -175,17 +175,26 @@ cfddns dns example.com [--type A] [--all]
 #   live records (type/name/content/ttl/proxy/track); --all includes
 #   soft-disabled history in the local DB
 
-cfddns dns add example.com A www 1.2.3.4 [--ttl 300] [--proxy|--no-proxy]
+cfddns dns add example.com A www [--ttl 300] [--proxy|--no-proxy]
+cfddns dns add example.com A mail 10.0.0.5
+cfddns dns add example.com A '*'             # wildcard: the star MUST be quoted
 cfddns dns add example.com MX @ mail.example.com --prio 10
 cfddns dns add example.com TXT _dmarc "v=DMARC1; p=none"
 #   supported types: A, AAAA, CNAME, MX, TXT. Writes Cloudflare first, then
-#   records them in the local DB. A records of managed zones are born track=on.
+#   records them in the local DB. An A record WITHOUT an IP uses the current
+#   public IP and is born track=on (follows home); an explicit IP is used
+#   verbatim and born track=off. The wildcard name is '*' and must be quoted
+#   so the shell does not expand it.
 
 cfddns dns update example.com www --content 5.6.7.8 [--ttl 300] [--no-proxy]
 #   change content / ttl / proxy / prio; track flag is preserved
 
 cfddns dns rm example.com www -y
-#   deletes the record on Cloudflare; the local row is soft-disabled
+#   deletes the record on Cloudflare; the local row is soft-disabled. When
+#   several same-name records match (dual-A), the candidates are listed for
+#   selection — Enter/1 picks the first, 'a' deletes them all, or pass the
+#   content value / record id / --all to skip the prompt.
+```
 ```
 
 ### Automation
