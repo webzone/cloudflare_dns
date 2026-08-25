@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"strings"
 
 	"github.com/webzone/cloudflare_dns/internal/cf"
 	"github.com/webzone/cloudflare_dns/internal/store"
@@ -14,7 +15,7 @@ import (
 type IPDetector func(ctx context.Context) (netip.Addr, error)
 
 // Updater keeps A records tracking the home public IP in sync. Cloudflare is
-// updated first; the local mirror follows only after each Cloudflare call
+// updated first; the local DB follows only after each Cloudflare call
 // succeeds, per the "Cloudflare is the single source of truth" rule.
 type Updater struct {
 	cf      *cf.Client
@@ -112,12 +113,13 @@ func (u *Updater) reconcileZones(ctx context.Context, ip string) error {
 	return nil
 }
 
-// Run performs one update-ip pass. It first reconciles the zone set (new
-// zones on Cloudflare get initialized, managed zones that vanished are
-// deregistered), then compares every track_ip=1 record against the single
-// detected public IP straight from the mirror — unchanged IP exits with zero
-// Cloudflare API calls, Cloudflare is only written for records that differ,
-// and the mirror follows each Cloudflare write only after it succeeded.
+// Run performs one update-ip pass. It first reconciles the zone set, then
+// compares every tracked (track_ip=1) A record straight against the detected
+// public IP from the local DB: records already pointing at it are skipped
+// (no Cloudflare call), every other tracked record — wherever its content
+// came from — is updated to the home IP, Cloudflare first, mirror after each
+// success. last_known_ip is informational bookkeeping only; it never gates
+// the scan, so records re-flagged track=on mid-IP-cycle still converge.
 func (u *Updater) Run(ctx context.Context) error {
 	addr, err := u.detect(ctx)
 	if err != nil {
@@ -137,14 +139,12 @@ func (u *Updater) Run(ctx context.Context) error {
 	}
 	if !known || last == "" {
 		u.log.Info("bootstrapping IP state (no previous known IP)", "ip", ip)
-		if u.dryRun {
-			return nil
+		if !u.dryRun {
+			if err := u.st.SetState(ctx, store.StateKeyLastIP, ip); err != nil {
+				return err
+			}
+			last, known = ip, true
 		}
-		return u.st.SetState(ctx, store.StateKeyLastIP, ip)
-	}
-	if last == ip {
-		u.log.Info("public IP unchanged", "ip", ip)
-		return nil
 	}
 
 	recs, err := u.st.ListTrackedARecords(ctx)
@@ -152,16 +152,18 @@ func (u *Updater) Run(ctx context.Context) error {
 		return err
 	}
 
-	// Compare every tracked record's mirror content against the detected
-	// IP once. Records already pointing at it need no Cloudflare call.
-	pending, _ := splitTracked(recs, ip)
+	// The comparison is against the detected IP directly — every tracked
+	// record, regardless of last_known_ip.
+	pending, skipped := splitTracked(recs, ip)
 	if len(pending) == 0 {
-		u.log.Info("all tracked records already at the detected IP; adopting new state",
-			"from", last, "to", ip, "tracked", len(recs))
-		if u.dryRun {
-			return nil
+		u.log.Info("all tracked A records already point at the public IP", "ip", ip,
+			"tracked", len(recs), "last_known_ip", lastKnown(last, known), "dry_run", u.dryRun)
+		if (!known || last != ip) && !u.dryRun {
+			if err := u.st.SetState(ctx, store.StateKeyLastIP, ip); err != nil {
+				return err
+			}
 		}
-		return u.st.SetState(ctx, store.StateKeyLastIP, ip)
+		return nil
 	}
 
 	updated, failed := 0, 0
@@ -170,8 +172,8 @@ func (u *Updater) Run(ctx context.Context) error {
 		if ttl <= 0 {
 			ttl = u.autoTTL
 		}
-		u.log.Info("updating A record to new public IP",
-			"record", r.RecordID, "zone", r.ZoneID, "name", r.Name, "from", last, "to", ip, "dry_run", u.dryRun)
+		u.log.Info("updating A record to public IP",
+			"record", r.RecordID, "zone", r.ZoneID, "name", r.Name, "from", r.Content, "to", ip, "dry_run", u.dryRun)
 		if u.dryRun {
 			updated++
 			continue
@@ -180,14 +182,29 @@ func (u *Updater) Run(ctx context.Context) error {
 			ID: r.RecordID, ZoneID: r.ZoneID, Type: "A", Name: r.Name,
 			Proxied: r.Proxied, TTL: ttl,
 		}, ip); err != nil {
-			u.log.Error("Cloudflare update failed; mirror left unchanged, will retry",
+			if isDuplicateRecordErr(err) {
+				// Cloudflare already has this name+type+content: this record
+				// can never follow the home IP without duplicating another
+				// record, so it is structurally excluded — untrack locally
+				// and stop retrying it.
+				if !u.dryRun {
+					if terr := u.st.SetRecordTrack(ctx, r.ID, false); terr != nil {
+						u.log.Error("untrack duplicate-blocked record failed", "record", r.RecordID, "err", terr)
+					}
+				}
+				u.log.Warn("record cannot follow the home IP (identical A record already exists); untracked locally",
+					"record", r.RecordID, "zone", r.ZoneID, "name", r.Name)
+				skipped++
+				continue
+			}
+			u.log.Error("Cloudflare update failed; local DB left unchanged, will retry",
 				"record", r.RecordID, "err", err)
 			failed++
 			continue
 		}
-		// Cloudflare accepted the change: only now mirror it locally.
+		// Cloudflare accepted the change: only now record it locally.
 		if err := u.st.UpdateRecordContent(ctx, r.ID, ip); err != nil {
-			u.log.Error("Cloudflare updated but mirror write failed",
+			u.log.Error("Cloudflare updated but local DB write failed",
 				"record", r.RecordID, "err", err)
 			failed++
 			continue
@@ -196,13 +213,25 @@ func (u *Updater) Run(ctx context.Context) error {
 	}
 
 	u.log.Info("IP update finished", "updated", updated, "failed", failed,
-		"skipped", len(recs)-len(pending), "total", len(recs), "dry_run", u.dryRun)
+		"skipped", skipped, "total", len(recs), "dry_run", u.dryRun)
 	if failed > 0 {
-		// Keep last_known_ip at the old value so failed records retry next run.
 		return fmt.Errorf("%d of %d records updated", updated, len(pending))
 	}
 	if u.dryRun {
 		return nil
 	}
 	return u.st.SetState(ctx, store.StateKeyLastIP, ip)
+}
+
+func lastKnown(v string, known bool) string {
+	if !known || v == "" {
+		return "unknown"
+	}
+	return v
+}
+
+// isDuplicateRecordErr reports whether Cloudflare rejected the write because
+// an identical record (name+type+content) already exists (API code 81058).
+func isDuplicateRecordErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), `"code":81058`)
 }

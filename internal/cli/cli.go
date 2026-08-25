@@ -78,9 +78,11 @@ AUTOMATION
                               the home IP (Cloudflare first, local DB after)
   init <zone> [--wildcard]    initialize a zone the owner added on CF:
                               base A records (@, www [+ *]) at the home IP
-  track <zone> [name] on|off  mark A record(s) as following (on) or not
+  track <zone> [name] [ip] on|off
+                              mark A record(s) as following (on) or not
                               following (off) the home IP; name can be
-                              @, *, www or any FQDN (no name = whole zone)
+                              @, *, www or any FQDN (no name = whole zone);
+                              an IP disambiguates same-name dual A records
   purge [zone]                purge edge cache of all/one managed zone
   status                      overview: home IP, local DB state, track counts
 
@@ -427,8 +429,10 @@ func (a *App) runInit(ctx context.Context, zone string, wildcard, dryRun bool) e
 }
 
 func (a *App) runTrack(ctx context.Context, args []string, dryRun bool) error {
-	if len(args) < 2 || len(args) > 3 {
-		return errors.New("usage: cfddns track <zone> [name] on|off")
+	// forms: track <zone> on|off | track <zone> <name> on|off |
+	//        track <zone> <name> <content> on|off (disambiguate dual records)
+	if len(args) < 2 || len(args) > 4 {
+		return errors.New("usage: cfddns track <zone> [name] [content] on|off")
 	}
 	zone := args[0]
 	onOff := args[len(args)-1]
@@ -442,8 +446,12 @@ func (a *App) runTrack(ctx context.Context, args []string, dryRun bool) error {
 		return fmt.Errorf(`track flag must be "on" or "off", got %q`, onOff)
 	}
 	name := ""
-	if len(args) == 3 {
+	var content string
+	if len(args) >= 3 {
 		name = args[1]
+	}
+	if len(args) == 4 {
+		content = args[2]
 	}
 
 	st, closeFn, err := a.openStore(ctx)
@@ -474,13 +482,29 @@ func (a *App) runTrack(ctx context.Context, args []string, dryRun bool) error {
 	}
 
 	target := service.FQDNHost(name, zone)
-	rec, ok, err := st.FindRecordByName(ctx, dz.ID, target)
+	recs, err := st.ListRecords(ctx, dz.ID)
 	if err != nil {
 		return err
 	}
-	if !ok {
+	var matches []store.Record
+	for _, r := range recs {
+		if strings.EqualFold(r.Name, target) {
+			if content != "" && r.Content != content {
+				continue
+			}
+			matches = append(matches, r)
+		}
+	}
+	if len(matches) == 0 {
+		if content != "" {
+			return fmt.Errorf("no record %q with content %q in zone %s", target, content, zone)
+		}
 		return fmt.Errorf("no record %q in zone %s", target, zone)
 	}
+	if len(matches) > 1 {
+		return fmt.Errorf("multiple records at %q in %s; disambiguate by content: cfddns track <zone> <name> <content> on|off", target, zone)
+	}
+	rec := matches[0]
 	if dryRun {
 		fmt.Printf("would set track=%v on %s (%s)\n", track, target, rec.Content)
 		return nil

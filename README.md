@@ -26,10 +26,14 @@ vanished).
 ## Features
 
 - `update-ip` — dynamic DNS. Detects your public IP once per run (3
-  independent sources, 2 must agree), moves every tracked A record to it
-  (Cloudflare first, local DB after each success), **zero API calls** when
-  the IP is unchanged. Also reconciles the zone set: new zones get
-  initialized, zones that vanished get deregistered.
+  independent sources, 2 must agree), then compares **every `track=1` A
+  record straight against that IP** and updates each one that differs
+  (Cloudflare first, local DB after each success) — including records
+  flagged tracked mid-IP-cycle. Records already at the IP are skipped, so
+  nothing changed means **zero API calls**. A record Cloudflare refuses
+  because an identical one already exists (dual-A pairs) is untracked
+  automatically. Also reconciles the zone set: new zones get initialized,
+  zones that vanished get deregistered.
 - `sync` — records all Cloudflare zones and records into the local SQLite
   store; marks present zones `registrar=cloudflare`; auto-creates any missing
   `@`/`www`/`*` A records at the home IP.
@@ -192,6 +196,9 @@ cfddns update-ip                             # dynamic DNS + zone reconcile
 cfddns init example.com [--wildcard]         # base @/www (+ *) at home IP
 cfddns track example.com on|off              # whole zone follows home IP
 cfddns track example.com www off             # one record (name: @, * or FQDN)
+cfddns track example.com www 15.197.212.58 off
+                                             # same-name dual records:
+                                             # disambiguate by content
 cfddns purge [example.com]                   # edge-cache purge (managed zones)
 cfddns status                                # overview
 ```
