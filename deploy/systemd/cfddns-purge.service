@@ -9,7 +9,6 @@ Type=oneshot
 User=user
 Group=user
 ExecStart=/usr/local/bin/cfddns purge
-EnvironmentFile=/etc/cfddns/cfddns.env
 StandardOutput=append:/var/log/cfddns/cfddns.log
 StandardError=append:/var/log/cfddns/cfddns.log
 TimeoutStartSec=120

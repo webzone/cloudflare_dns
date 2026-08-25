@@ -77,19 +77,24 @@ Put it on `PATH` (`sudo install -m 0755 cfddns /usr/local/bin/`).
 ### Linux server with systemd timers (recommended)
 
 ```sh
-sudo mkdir -p /etc/cfddns /var/log/cfddns /var/lib/cfddns
-sudo install -m 0600 -o root -g root deploy/cfddns.env.example /etc/cfddns/cfddns.env
+sudo mkdir -p /var/log/cfddns
 sudo install -m 0644 deploy/logrotate/cfddns /etc/logrotate.d/cfddns
-# 1. edit /etc/cfddns/cfddns.env: real credentials + CFDDNS_DB path
-# 2. install units:
+# install units (no env file needed — defaults + token set take care of it):
 sudo install -m 0644 deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now cfddns-update.timer cfddns-sync.timer
+# one-time token (as the user the units run as):
+cfddns token set
 tail -f /var/log/cfddns/cfddns.log
 ```
 
 - `cfddns-update.timer`: dynamic-IP update every 5 minutes (2 min after boot).
 - `cfddns-sync.timer`: daily 04:00 (`Persistent`, catches up after downtime).
+
+The units run `cfddns update-ip` / `cfddns sync`, as the `user` account by
+default — the SQLite database and token live in that user's `~/.cfddns/`, so
+no configuration file is required. Adjust `User=`/`Group=` if you run under a
+different account.
 
 Other schedulers work identically (cron, launchd, Task Scheduler calling
 `cfddns update-ip` every 5 minutes + `cfddns sync` daily); the binary has its
@@ -98,18 +103,16 @@ own overlap lock.
 ### macOS / Windows
 
 ```sh
-cp deploy/cfddns.env.example ~/.cfddns.env   # Windows: %USERPROFILE%\.cfddns.env
-# fill with credentials + CFDDNS_DB (Windows example: C:\Data\cfddns.db)
-cfddns status        # verify auth + local DB
-cfddns --dry-run sync
+cfddns token set            # one-time; prompts for the token
+cfddns status               # verify auth + local DB
+cfddns --dry-run sync       # preview before the first real sync
 cfddns sync
 # schedule cfddns update-ip (launchd / Task Scheduler)
 ```
 
-Env-file lookup order: `$CFDDNS_ENV_FILE` → `./.env` →
-`/etc/cfddns/cfddns.env` (Linux; if readable) → `~/.cfddns.env`
-(`%USERPROFILE%\.cfddns.env` on Windows). Already-set environment variables
-win over the file.
+Everything (token + SQLite database) lives under `~/.cfddns/`
+(`%USERPROFILE%\.cfddns\` on Windows) — nothing else needs to be created
+manually.
 
 ## Configure
 
@@ -127,10 +130,11 @@ cfddns token rm                      # remove the stored token
 ```
 
 It is stored at `~/.cfddns/token` (Windows: `%USERPROFILE%\.cfddns\token`;
-override with `CFDDNS_TOKEN_FILE`) with 0600 permissions. Environment
-variables are still honored if set — explicit conventions:
-`CLOUDFLARE_API_TOKEN` beats the stored token, which beats the legacy
-`CLOUDFLARE_API_EMAIL` + `CLOUDFLARE_API_KEY`.
+override with `CFDDNS_TOKEN_FILE`) with 0600 permissions. The SQLite database
+defaults to the same directory (`~/.cfddns/cfddns.db`; override with
+`CFDDNS_DB`). Environment variables are still honored if set — explicit
+conventions: `CLOUDFLARE_API_TOKEN` beats the stored token, which beats the
+legacy `CLOUDFLARE_API_EMAIL` + `CLOUDFLARE_API_KEY`.
 
 Create a token at dash.cloudflare.com → My Profile → API Tokens → Create
 Token with permissions `Zone.Zone:Read`, `Zone.DNS:Edit`, `Zone.Cache:Purge`,
@@ -218,7 +222,9 @@ cfddns status                                # overview
 ## Security
 
 - Use a scoped API token, never the account global key.
-- The SQLite store contains a copy of your DNS but no Cloudflare secrets;
-  `/etc/cfddns/cfddns.env` must stay root-only, and the database file should
-  be owner-only.
-- Never commit real secrets (`.env*` and `*.db` are gitignored).
+- The Cloudflare token is stored owner-only (`~/.cfddns/token`, mode 0600);
+  if you set it via the `CLOUDFLARE_API_TOKEN` environment variable instead,
+  keep that variable out of shared scripts and logs.
+- The SQLite database contains a copy of your DNS (no Cloudflare secrets);
+  it defaults to `~/.cfddns/cfddns.db` and should stay owner-only.
+- Never commit real secrets; `*.db` is gitignored.

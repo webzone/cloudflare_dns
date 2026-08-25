@@ -4,8 +4,6 @@
 
 # Local dev secrets — never commit
 .env
-.env.local
-cfddns.env
 
 # Local mirror database
 *.db

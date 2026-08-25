@@ -8,19 +8,12 @@ import (
 )
 
 // TokenFilePath returns where cfddns stores its Cloudflare API token:
-// $CFDDNS_TOKEN_FILE, else ~/.cfddns/token (%USERPROFILE%\.cfddns\token on
-// Windows).
+// $CFDDNS_TOKEN_FILE, else <user config dir>/token.
 func TokenFilePath() string {
 	if p := getenv("CFDDNS_TOKEN_FILE"); p != "" {
 		return p
 	}
-	if p := getenv("USERPROFILE"); p != "" {
-		return filepath.Join(p, ".cfddns", "token")
-	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		return filepath.Join(home, ".cfddns", "token")
-	}
-	return ".cfddns/token"
+	return filepath.Join(userConfigDir(), "token")
 }
 
 // LoadTokenFile returns the stored token ("" when none is stored).

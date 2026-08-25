@@ -9,7 +9,6 @@ Type=oneshot
 User=user
 Group=user
 ExecStart=/usr/local/bin/cfddns update-ip
-EnvironmentFile=/etc/cfddns/cfddns.env
 # journald stdout capture is unreliable on this box, so logs go to a file
 StandardOutput=append:/var/log/cfddns/cfddns.log
 StandardError=append:/var/log/cfddns/cfddns.log
