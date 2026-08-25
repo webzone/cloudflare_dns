@@ -20,13 +20,39 @@ deploy/              systemd units + env example + logrotate
 migrations embedded  internal/store/migrations/
 ```
 
-## Commands
-
+cfddns [--dry-run] update-ip            reconcile zone set (init new zones,
+                                        deregister zones that vanished), then
+                                        move tracked A records: Cloudflare
+                                        first, mirror after success
+cfddns [--dry-run] init <zone> [--wildcard]
+                                        create/mirror base A records (@ and www,
+                                        + * with --wildcard) at the home IP
+cfddns track <zone> [name] on|off       mark A record(s) as following (on) or
+                                        not following (off) the home IP; name is
+                                        @, *, www or any FQDN (no name = zone)
+cfddns [--dry-run] purge [zone]         purge edge cache (all managed zones or
+                                        one named zone)
+cfddns zones [<zone>]                   list zones (or one zone's detail)
+cfddns dns <zone> [--type T] [--all]    list a zone's records (track column;
+                                        live records only unless --all)
+cfddns dns add <zone> <TYPE> <name> <content> [--ttl N] [--proxy|--no-proxy] [--prio N]
+                                        create A/AAAA/CNAME/MX/TXT record;
+                                        A records of managed zones are tracked
+cfddns dns update <zone> <name> [--content X] [--ttl N] [--proxy|--no-proxy] [--prio N]
+                                        change fields of an existing record
+cfddns dns rm <zone> <name> -y          delete a record (mirror soft-disables)
+cfddns status                           overview: home IP, mirror, track counts
+cfddns help                             show help
 ```
-cfddns [--dry-run] sync                 mirror Cloudflare zones/records into the
-                                        DB; mark every present zone
-                                        registrar=cloudflare; auto-create any
-                                        missing @/www/* A records at home IP
+
+Zones (domains) are added/removed **only on the Cloudflare website**
+(dash.cloudflare.com) — cfddns reads the zone list and manages DNS records
+inside zones; it never creates or deletes zones itself. New zones appear in
+the mirror after `sync`, or within 5 minutes via `update-ip`'s reconcile,
+which initializes the standard base records automatically.
+
+`--dry-run` (or env `CF_DDNS_DRY_RUN=1`) logs every planned change and writes
+nothing — run it before any real run.
 cfddns [--dry-run] update-ip            A records tracking the home IP:
                                         Cloudflare first, mirror after success
 cfddns [--dry-run] init <zone> [--wildcard]

@@ -353,7 +353,8 @@ func (s *Store) SetZoneTrackARecords(ctx context.Context, domainID int64, track 
 	return n, nil
 }
 
-// FindRecordByName returns the mirror row for a host name (FQDN) in a domain.
+// FindRecordByName returns the mirror row for a host name (FQDN) in a domain,
+// regardless of record type.
 func (s *Store) FindRecordByName(ctx context.Context, domainID int64, name string) (Record, bool, error) {
 	var r Record
 	var proxied, track int
@@ -392,6 +393,21 @@ func (s *Store) ZoneByName(ctx context.Context, name string) (Zone, bool, error)
 		return Zone{}, false, fmt.Errorf("zone by name %s: %w", name, err)
 	}
 	return z, true, nil
+}
+
+// CountManagedATrack returns how many A records of managed (on,
+// registrar=cloudflare) zones are tracked vs explicitly untracked.
+func (s *Store) CountManagedATrack(ctx context.Context) (tracked, untracked int64, err error) {
+	var total int64
+	row := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(track_ip = 1), 0)
+		FROM dns d JOIN domain dm ON dm.domainID = d.domain_id
+		WHERE d.type = 'A' AND d.status = 'on'
+		  AND dm.status = 'on' AND dm.registrar = 'cloudflare'`)
+	if err := row.Scan(&total, &tracked); err != nil {
+		return 0, 0, fmt.Errorf("count managed A track: %w", err)
+	}
+	return tracked, total - tracked, nil
 }
 
 // --- app state ---

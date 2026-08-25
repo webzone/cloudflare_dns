@@ -149,3 +149,110 @@ func (c *Client) PurgeCache(ctx context.Context, zoneID string) error {
 	}
 	return nil
 }
+
+// SupportedRecordTypes are the DNS record types cfddns can manage.
+func SupportedRecordTypes() []string {
+	return []string{"A", "AAAA", "CNAME", "MX", "TXT"}
+}
+
+// recordParam builds the SDK request body for a supported record type.
+// Returns a concrete dns.XRecordParam; callers assert it against the union
+// interface for Create vs Update.
+func recordParam(r Record) (any, error) {
+	ttl := r.TTL
+	if ttl <= 0 {
+		ttl = 1
+	}
+	switch r.Type {
+	case "A":
+		return dns.ARecordParam{
+			Name: cloudflare.F(r.Name), TTL: cloudflare.F(dns.TTL(ttl)),
+			Type: cloudflare.F(dns.ARecordType("A")), Content: cloudflare.F(r.Content),
+			Proxied: cloudflare.F(r.Proxied),
+		}, nil
+	case "AAAA":
+		return dns.AAAARecordParam{
+			Name: cloudflare.F(r.Name), TTL: cloudflare.F(dns.TTL(ttl)),
+			Type: cloudflare.F(dns.AAAARecordType("AAAA")), Content: cloudflare.F(r.Content),
+			Proxied: cloudflare.F(r.Proxied),
+		}, nil
+	case "CNAME":
+		return dns.CNAMERecordParam{
+			Name: cloudflare.F(r.Name), TTL: cloudflare.F(dns.TTL(ttl)),
+			Type: cloudflare.F(dns.CNAMERecordType("CNAME")), Content: cloudflare.F(r.Content),
+			Proxied: cloudflare.F(r.Proxied),
+		}, nil
+	case "MX":
+		return dns.MXRecordParam{
+			Name: cloudflare.F(r.Name), TTL: cloudflare.F(dns.TTL(ttl)),
+			Type: cloudflare.F(dns.MXRecordType("MX")), Content: cloudflare.F(r.Content),
+			Priority: cloudflare.F(float64(r.Priority)), Proxied: cloudflare.F(r.Proxied),
+		}, nil
+	case "TXT":
+		return dns.TXTRecordParam{
+			Name: cloudflare.F(r.Name), TTL: cloudflare.F(dns.TTL(ttl)),
+			Type: cloudflare.F(dns.TXTRecordType("TXT")), Content: cloudflare.F(r.Content),
+			Proxied: cloudflare.F(r.Proxied),
+		}, nil
+	}
+	return nil, fmt.Errorf("unsupported record type %q (supported: A, AAAA, CNAME, MX, TXT)", r.Type)
+}
+
+// CreateDNSRecord adds a record of a supported type to a zone and returns the
+// created record including its Cloudflare ID.
+func (c *Client) CreateDNSRecord(ctx context.Context, zoneID string, r Record) (Record, error) {
+	body, err := recordParam(r)
+	if err != nil {
+		return Record{}, err
+	}
+	newBody, ok := body.(dns.RecordNewParamsBodyUnion)
+	if !ok {
+		return Record{}, fmt.Errorf("internal: record %s not a create body", r.Type)
+	}
+	res, err := c.api.DNS.Records.New(ctx, dns.RecordNewParams{
+		ZoneID: cloudflare.F(zoneID),
+		Body:   newBody,
+	})
+	if err != nil {
+		return Record{}, fmt.Errorf("create %s record %s in zone %s: %w", r.Type, r.Name, zoneID, err)
+	}
+	return Record{
+		ID: res.ID, ZoneID: zoneID, Type: string(res.Type), Name: res.Name,
+		Content: res.Content, Proxied: res.Proxied, TTL: int(res.TTL), Priority: int(res.Priority),
+	}, nil
+}
+
+// UpdateDNSRecord rewrites a supported-type record (same type, new fields).
+func (c *Client) UpdateDNSRecord(ctx context.Context, r Record) (Record, error) {
+	body, err := recordParam(r)
+	if err != nil {
+		return Record{}, err
+	}
+	updateBody, ok := body.(dns.RecordUpdateParamsBodyUnion)
+	if !ok {
+		return Record{}, fmt.Errorf("internal: record %s not an update body", r.Type)
+	}
+	res, err := c.api.DNS.Records.Update(ctx, r.ID, dns.RecordUpdateParams{
+		ZoneID: cloudflare.F(r.ZoneID),
+		Body:   updateBody,
+	})
+	if err != nil {
+		return Record{}, fmt.Errorf("update %s record %s in zone %s: %w", r.Type, r.Name, r.ZoneID, err)
+	}
+	return Record{
+		ID: res.ID, ZoneID: r.ZoneID, Type: string(res.Type), Name: res.Name,
+		Content: res.Content, Proxied: res.Proxied, TTL: int(res.TTL), Priority: int(res.Priority),
+	}, nil
+}
+
+// DeleteDNSRecord removes a record from Cloudflare. The mirror marks it
+// status='off' rather than deleting, consistent with the soft-delete policy.
+func (c *Client) DeleteDNSRecord(ctx context.Context, zoneID, recordID string) error {
+	_, err := c.api.DNS.Records.Delete(ctx, recordID, dns.RecordDeleteParams{
+		ZoneID: cloudflare.F(zoneID),
+	})
+	if err != nil {
+		return fmt.Errorf("delete record %s in zone %s: %w", recordID, zoneID, err)
+	}
+	return nil
+}
