@@ -40,7 +40,7 @@ vanished).
 Build from source (Go ≥ 1.21) — the result is a static standalone binary:
 
 ```sh
-git clone git@github.com:webzone/cloudflare_dns.git   # private repo
+git clone git@github.com:webzone/cloudflare_dns.git
 cd cloudflare_dns
 go build -o cfddns ./cmd/cfddns                       # your OS/arch
 ```
