@@ -20,6 +20,10 @@ import (
 	"github.com/webzone/cloudflare_dns/internal/store"
 )
 
+// Version is stamped at build time (-ldflags
+// "-X github.com/webzone/cloudflare_dns/internal/cli.Version=v0.1.0").
+var Version = "dev"
+
 // App is the cfddns command dispatcher.
 type App struct {
 	cfg *config.Config
@@ -83,9 +87,9 @@ GLOBAL
 
 // cmdOpts holds flags parsed from the command line.
 type cmdOpts struct {
-	dryRun, wildcard, yes, proxy, noProxy, all bool
-	ttl, prio                                  int
-	typ, content                               string
+	dryRun, wildcard, yes, proxy, noProxy, all, version bool
+	ttl, prio                                         int
+	typ, content                                      string
 }
 
 // parseOpts splits flag tokens (any position) from positional args.
@@ -105,6 +109,8 @@ func parseOpts(args []string) (rest []string, o cmdOpts, err error) {
 			o.noProxy = true
 		case "--all":
 			o.all = true
+		case "--version", "-V":
+			o.version = true
 		case "--ttl", "--prio", "--type", "--content":
 			if i+1 >= len(args) {
 				return nil, o, fmt.Errorf("%s needs a value", a)
@@ -141,6 +147,10 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	rest, o, err := parseOpts(args)
 	if err != nil {
 		return err
+	}
+	if o.version {
+		fmt.Println(Version)
+		return nil
 	}
 	if len(rest) == 0 {
 		fmt.Print(Usage)
@@ -186,6 +196,9 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		}
 	case "help", "-h", "--help":
 		fmt.Print(Usage)
+		return nil
+	case "version":
+		fmt.Println(Version)
 		return nil
 	default:
 		fmt.Print(Usage)

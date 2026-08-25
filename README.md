@@ -1,5 +1,9 @@
 # cfddns — Cloudflare domain management & dynamic IP update
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Go Report Card](https://goreportcard.com/badge/github.com/webzone/cloudflare_dns)](https://goreportcard.com/report/github.com/webzone/cloudflare_dns)
+[![Go Reference](https://pkg.go.dev/badge/github.com/webzone/cloudflare_dns.svg)](https://pkg.go.dev/github.com/webzone/cloudflare_dns)
+
 A single static Go binary with two jobs:
 
 1. **Domain management** — `zones`, `dns` (list/add/update/rm), `track`,
@@ -43,6 +47,19 @@ Build from source (Go ≥ 1.21) — the result is a static standalone binary:
 git clone git@github.com:webzone/cloudflare_dns.git
 cd cloudflare_dns
 go build -o cfddns ./cmd/cfddns                       # your OS/arch
+cfddns version                                       # "dev" unless stamped
+```
+
+Or install the tagged release directly (version baked in):
+
+```sh
+go install github.com/webzone/cloudflare_dns/cmd/cfddns@v0.1.0
+```
+
+To stamp the version manually:
+
+```sh
+go build -ldflags "-s -w -X github.com/webzone/cloudflare_dns/internal/cli.Version=v0.1.0" -o cfddns ./cmd/cfddns
 ```
 
 Cross-compile (each produces a standalone binary):

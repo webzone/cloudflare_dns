@@ -24,14 +24,18 @@ func run() int {
 	}
 	defer unlock()
 
-	// Help and no-args work without any configuration.
+	// Help, version and no-args work without any configuration.
 	if len(os.Args) == 1 {
 		fmt.Print(cli.Usage)
 		return 0
 	}
 	for _, a := range os.Args[1:] {
-		if a == "help" || a == "--help" || a == "-h" {
+		switch a {
+		case "help", "--help", "-h":
 			fmt.Print(cli.Usage)
+			return 0
+		case "version", "--version", "-V":
+			fmt.Println(cli.Version)
 			return 0
 		}
 	}
