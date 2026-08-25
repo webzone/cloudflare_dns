@@ -25,10 +25,10 @@ func TestMatchLegacyLabels(t *testing.T) {
 	rec := cfRecord("A", "www.example.com", "1.2.3.4")
 
 	cases := []struct {
-		name     string
-		rec      cf.Record
-		row      store.Record
-		want     int
+		name string
+		rec  cf.Record
+		row  store.Record
+		want int
 	}{
 		{"@ apex", cfRecord("A", zone, "1.2.3.4"), store.Record{ID: 1, Type: "A", Name: "@", Content: "1.2.3.4"}, 0},
 		{"@ vs subdomain", rec, store.Record{ID: 2, Type: "A", Name: "@", Content: "1.2.3.4"}, -1},

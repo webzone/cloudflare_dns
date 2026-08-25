@@ -1,178 +1,195 @@
-# cfddns — Cloudflare DNS mirror & dynamic DNS
+# cfddns — Cloudflare DNS mirror & domain management
 
-Replaces the legacy PHP scripts (`updateDNS.php`, `getDomains.php`,
-`setZoneSettings.php`, `purge_all_caches.php`) with a single Go binary.
-**Cloudflare is the single source of truth**; a local MariaDB mirror is kept
-in line with it so LAN tooling can read DNS state without hitting the API.
+A single static Go binary that replaces the legacy PHP scripts
+(`updateDNS.php`, `getDomains.php`, `setZoneSettings.php`,
+`purge_all_caches.php`). It keeps a local MariaDB mirror of your Cloudflare
+DNS and manages your records: dynamic-DNS IP updates, per-record
+home-IP tracking, and a full DNS management CLI.
 
-## Layout
+**Cloudflare is the single source of truth.** Zones are added/removed **only
+on the Cloudflare website** (dash.cloudflare.com) — cfddns never creates or
+deletes zones; it detects zone changes and reacts (initializes new zones,
+deregisters zones that vanished).
 
-```
-cmd/cfddns/          entry point (flock singleton guard)
-internal/config/     env loading + validation
-internal/ip/         multi-source public-IP detection
-internal/cf/         cloudflare-go v7 wrapper (zones, records, cache purge)
-internal/store/      MariaDB mirror + embedded SQL migrations
-internal/service/    sync (CF→DB + base-record completion), update-ip, init,
-                     track, purge
-internal/cli/        subcommand dispatch + flags
-deploy/              systemd units + env example + logrotate
-migrations embedded  internal/store/migrations/
-```
+- Linux / macOS / Windows binaries built from one codebase (static, no runtime
+  dependencies beyond network + optional MariaDB).
 
-cfddns [--dry-run] update-ip            reconcile zone set (init new zones,
-                                        deregister zones that vanished), then
-                                        move tracked A records: Cloudflare
-                                        first, mirror after success
-cfddns [--dry-run] init <zone> [--wildcard]
-                                        create/mirror base A records (@ and www,
-                                        + * with --wildcard) at the home IP
-cfddns track <zone> [name] on|off       mark A record(s) as following (on) or
-                                        not following (off) the home IP; name is
-                                        @, *, www or any FQDN (no name = zone)
-cfddns [--dry-run] purge [zone]         purge edge cache (all managed zones or
-                                        one named zone)
-cfddns zones [<zone>]                   list zones (or one zone's detail)
-cfddns dns <zone> [--type T] [--all]    list a zone's records (track column;
-                                        live records only unless --all)
-cfddns dns add <zone> <TYPE> <name> <content> [--ttl N] [--proxy|--no-proxy] [--prio N]
-                                        create A/AAAA/CNAME/MX/TXT record;
-                                        A records of managed zones are tracked
-cfddns dns update <zone> <name> [--content X] [--ttl N] [--proxy|--no-proxy] [--prio N]
-                                        change fields of an existing record
-cfddns dns rm <zone> <name> -y          delete a record (mirror soft-disables)
-cfddns status                           overview: home IP, mirror, track counts
-cfddns help                             show help
-```
+## Features
 
-Zones (domains) are added/removed **only on the Cloudflare website**
-(dash.cloudflare.com) — cfddns reads the zone list and manages DNS records
-inside zones; it never creates or deletes zones itself. New zones appear in
-the mirror after `sync`, or within 5 minutes via `update-ip`'s reconcile,
-which initializes the standard base records automatically.
+- `update-ip` — dynamic DNS. Detects your public IP once per run (3
+  independent sources, 2 must agree), moves every tracked A record to it
+  (Cloudflare first, mirror after each success), zero API calls when the IP
+  is unchanged. Also reconciles the zone set each run.
+- `sync` — mirrors all Cloudflare zones/records into MariaDB; marks present
+  zones `registrar=cloudflare`; auto-creates any missing `@`/`www`/`*` A
+  records at the home IP.
+- `track` — per-record "follow the home IP" flag. **Default is managed**:
+  every A record of a managed zone follows the home IP unless explicitly
+  untracked.
+- Management CLI — `zones`, `dns` (list/add/update/rm), `status`, `init`,
+  `purge`.
 
-`--dry-run` (or env `CF_DDNS_DRY_RUN=1`) logs every planned change and writes
-nothing — run it before any real run.
-cfddns [--dry-run] update-ip            A records tracking the home IP:
-                                        Cloudflare first, mirror after success
-cfddns [--dry-run] init <zone> [--wildcard]
-                                        create/mirror base A records (@ and www,
-                                        + * with --wildcard) at the home IP
-cfddns track <zone> [name] on|off       mark A record(s) as following (on) or
-                                        not following (off) the home IP; name is
-                                        @, *, www or any FQDN (no name = zone)
-cfddns [--dry-run] purge [zone]         purge edge cache (all managed zones or
-                                        one named zone)
-cfddns inspect zones                    list Cloudflare zones
-cfddns inspect records <zone>           list a zone's records (with track=…)
-cfddns help                             show help
-```
+## Install
 
-`--dry-run` (or env `CF_DDNS_DRY_RUN=1`) logs every planned change and writes
-nothing — run it before any real run.
+No package manager yet — build from source (Go ≥ 1.21) or copy a prebuilt
+binary. The tool is fully static; only `CF_DDNS_TEST_IP`-style env config and
+(optionally) MariaDB are needed.
 
-## Semantics
-
-- **`registrar` column** — "which registrar manages this domain". Every zone
-  seen on Cloudflare is marked `registrar='cloudflare'` by sync; that value is
-  the domain-level membership marker, and **all operations (`sync` record
-  mirroring, `update-ip`, `purge`) first select only
-  `registrar='cloudflare'` zones**. Domains not present on Cloudflare keep
-  their old value, get `status='off'` and are never operated on.
-- **`sync`** — lists all zones/records from Cloudflare and upserts the mirror
-  keyed by Cloudflare record ID; zones/records absent from Cloudflare are
-  marked `status='off'` (never deleted). Record names are stored as FQDNs
-  exactly as Cloudflare returns them; TTL 1 = "automatic".
-- **`track` flag** (`dns.track_ip`, the record-level gate) — **default is
-  managed**: every A record of a `registrar='cloudflare'` domain is `track=1`
-  (follows the home IP) unless explicitly marked `track=0` via
-  `cfddns track ... off`, which is the special-exception case (records serving
-  another server are mirrored but never rewritten to the home IP). `sync`
-  never flips an existing flag; records it mirrors in a managed domain are
-  born `track=1`.
-- **Base-record auto-completion** — every managed zone is guaranteed the
-  standard `@` / `www` / `*` A records: `init <zone>` creates them for a new
-  zone; `sync` detects and creates any of the three that are entirely absent,
-  pointing at the current home IP (proxied, auto TTL). Existing records at
-  those names — whatever they point at — are never touched by sync.
-- **`update-ip`** — detects the public IP **once** per run from 3 independent
-  HTTPS sources (two must agree, else the run is skipped), then reconciles the
-  zone set: a zone newly seen on Cloudflare is initialized (base `@`/`www`/`*`
-  records at the home IP, tracked, mirrored) and a managed zone that vanished
-  from Cloudflare is deregistered (`registrar` → `other`, `status` → `off`).
-  Unchanged IP → immediate exit with **zero remaining** Cloudflare API calls.
-  On a change it compares every `track=1` record (already filtered to
-  `registrar='cloudflare'` domains) straight against the local mirror, skips
-  records already at the new IP, updates **Cloudflare first**, and only after
-  each success writes the mirror. `last_known_ip` in `app_state` only advances
-  when every differing record succeeded, so failures retry next run.
-- **`init <zone>`** — for a domain just added to Cloudflare: detects the
-  public IP once, creates/updates the base A records (`@`, `www`, and `*`
-  with `--wildcard`) proxied with auto TTL, mirrors them and flags them
-  tracked, then seeds `last_known_ip`. Idempotent; safe to re-run.
-- **`purge`** — purges all cached content for one managed zone or every
-  managed zone (non-`cloudflare` zones are refused).
-- **Migrations** — embedded SQL runs automatically at startup; each file is
-  recorded in `schema_migrations` and applied at most once. MariaDB-only
-  syntax (`IF NOT EXISTS`); the target DB is MariaDB 10.11.
-
-## Configuration
-
-Values come from the environment, optionally overlaid from the first existing
-env file (dotenv syntax, existing environment variables win): `$CFDDNS_ENV_FILE`
-→ `./.env` → `/etc/cfddns/cfddns.env` → `~/.cfddns.env`. This makes manual
-runs (`cfddns sync`) work without sourcing anything, matching how the systemd
-units inject the same file.
-
-| Variable | Required | Purpose |
-|---|---|---|
-| `CLOUDFLARE_API_TOKEN` | one auth | scoped API token (recommended) |
-| `CLOUDFLARE_API_EMAIL` + `CLOUDFLARE_API_KEY` | one auth | legacy global key (dev fallback) |
-| `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DB` | yes | mirror database |
-| `LOG_LEVEL` | no | debug \| info \| warn \| error (default info) |
-| `CF_DDNS_DRY_RUN` | no | force dry-run |
-| `CF_DDNS_TEST_IP` | no | force an IP for testing (use with `--dry-run`) |
-
-`inspect zones` needs only Cloudflare auth; everything else needs both.
-
-## Deployment (Ubuntu — hivediskless)
+### Build for your platform
 
 ```sh
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o cfddns ./cmd/cfddns
-sudo install -m 0755 cfddns /usr/local/bin/cfddns
+git clone git@github.com:webzone/cloudflare_dns.git   # private repo
+cd cloudflare_dns
+go build -o cfddns ./cmd/cfddns                       # matches your OS/arch
+```
+
+Cross-compile matrix (each produces a standalone binary):
+
+```sh
+GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o cfddns-linux-amd64  ./cmd/cfddns
+GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -o cfddns-linux-arm64  ./cmd/cfddns
+GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o cfddns-darwin-amd64 ./cmd/cfddns
+GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -o cfddns-darwin-arm64 ./cmd/cfddns
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o cfddns.exe           ./cmd/cfddns
+```
+
+Place it anywhere on `PATH` (`sudo install -m 0755 cfddns /usr/local/bin/`).
+
+### Linux server (recommended: systemd timers)
+
+```sh
 sudo mkdir -p /etc/cfddns /var/log/cfddns
 sudo install -m 0600 -o root -g root deploy/cfddns.env.example /etc/cfddns/cfddns.env
 sudo install -m 0644 deploy/logrotate/cfddns /etc/logrotate.d/cfddns
-# fill /etc/cfddns/cfddns.env (real token/password), then:
+# 1. fill /etc/cfddns/cfddns.env with your real credentials (below)
+# 2. install units:
 sudo install -m 0644 deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now cfddns-update.timer cfddns-sync.timer
 tail -f /var/log/cfddns/cfddns.log
 ```
 
-Logs go to `/var/log/cfddns/cfddns.log` (journald stdout capture is
-unreliable on hivediskless); logrotate rotates daily, 14 copies kept.
+- `cfddns-update.timer`: every 5 minutes (2 min after boot).
+- `cfddns-sync.timer`: daily 04:00 (`Persistent`, catches up after downtime).
 
-Timers: `update-ip` every 5 minutes, `sync` daily at 04:00. The binary takes
-an advisory flock against overlapping runs.
+Scheduling without systemd: cron / launchd / Task Scheduler calling
+`cfddns update-ip` every 5 minutes and `cfddns sync` daily work the same way
+(the binary has its own overlap lock).
 
-### Replacing the legacy PHP cron
+### macOS / Windows (workstation or any always-on box)
 
-The old stack ran `/usr/bin/php /home/user/cloudflare/updateDNS.php` every
-minute and force-rewrote *every* A record of `registrar='cloudflare'` zones
-to the home IP, including records that legitimately pointed elsewhere.
-Cutover:
-1. Disable the old cron (backup at `/home/user/crontab.bak`).
-2. Install the Go binary + timers above.
-3. Keep `/home/user/cloudflare` (PHP) as a frozen reference until the new
-   stack has run for a full cycle, then retire it.
+```sh
+# one-time: configure
+cp deploy/cfddns.env.example ~/.cfddns.env      # macOS/Linux
+# Windows: %USERPROFILE%\.cfddns.env
+# fill with your credentials (below), then:
+cfddns status                                    # verify auth + mirror
+cfddns --dry-run sync                            # preview before first real run
+cfddns sync
+# schedule manually (launchd / Task Scheduler / cron): cfddns update-ip
+```
 
-## Security notes
+`/etc/cfddns/cfddns.env` is Linux-specific; on any OS the env-file lookup is:
+`$CFDDNS_ENV_FILE` → `./.env` → `/etc/cfddns/cfddns.env` (if readable) →
+`~/.cfddns.env` (`%USERPROFILE%\.cfddns.env` on Windows). Already-set
+environment variables always win over the file.
 
-- The legacy PHP code carried the Cloudflare **global API key** and MariaDB
-  password as plaintext in five files and in git history. Rotate to a scoped
-  API token (`Zone.Zone:Read`, `Zone.DNS:Edit`, `Zone.Cache:Purge`,
-  `Zone.Settings:Edit`) and a dedicated low-privilege MariaDB user before
-  exposing this repo further. `/etc/cfddns/cfddns.env` must stay root-only.
-- All SQL in the Go code is parameterized; the only multi-statement DSN flag
-  exists for the embedded migrations.
+## Configure
+
+Create a scoped Cloudflare API token (dash.cloudflare.com → My Profile → API
+Tokens → Create Token): permissions `Zone.Zone:Read`,
+`Zone.DNS:Edit`, `Zone.Cache:Purge`, `Zone.Settings:Edit`, resource
+"All zones". Also create the MariaDB user/database for the mirror.
+
+```
+CLOUDFLARE_API_TOKEN=<scoped token>          # preferred auth
+# legacy: CLOUDFLARE_API_EMAIL + CLOUDFLARE_API_KEY
+MYSQL_HOST=192.168.2.246                     # mirror database
+MYSQL_PORT=3306
+MYSQL_USER=domain
+MYSQL_PASSWORD=...
+MYSQL_DB=domain
+LOG_LEVEL=info                               # debug|info|warn|error
+# CF_DDNS_DRY_RUN=1                          # force dry-run everywhere
+# CF_DDNS_TEST_IP=1.2.3.4                    # testing only (with --dry-run)
+```
+
+The mirror schema (and all migrations) are created automatically on first
+run; no manual DDL. MariaDB ≥ 10.5 or MySQL ≥ 8 recommended.
+
+## Command reference
+
+```
+cfddns [--dry-run] <command> [args]
+```
+
+### Zones (read-only)
+
+```sh
+cfddns zones                  # name / zone id / registrar / status / record count
+cfddns zones example.com      # detail: registrar, status, record counts, tracked A
+```
+
+### DNS records
+
+```sh
+cfddns dns example.com [--type A] [--all]
+#   live records (type/name/content/ttl/proxy/track); --all includes
+#   soft-disabled mirror history
+
+cfddns dns add example.com A www 1.2.3.4 [--ttl 300] [--proxy|--no-proxy]
+cfddns dns add example.com MX @ mail.example.com --prio 10
+cfddns dns add example.com TXT _dmarc "v=DMARC1; p=none"
+#   supported types: A, AAAA, CNAME, MX, TXT. Writes Cloudflare first, then
+#   mirrors. A records of managed zones are born track=on.
+
+cfddns dns update example.com www --content 5.6.7.8 [--ttl 300] [--no-proxy]
+#   change content / ttl / proxy / prio; track flag is preserved
+
+cfddns dns rm example.com www -y
+#   deletes the record on Cloudflare; the mirror row is soft-disabled
+```
+
+### Automation
+
+```sh
+cfddns sync                                  # mirror CF → DB (idempotent)
+cfddns update-ip                             # dynamic DNS + zone reconcile
+cfddns init example.com [--wildcard]         # base @/www (+ *) at home IP
+cfddns track example.com on|off              # whole zone follows home IP
+cfddns track example.com www off             # one record (name: @, * or FQDN)
+cfddns purge [example.com]                   # edge-cache purge (managed zones)
+cfddns status                                # overview
+```
+
+## How it works
+
+- **Single source of truth**: every operation reads/writes Cloudflare first;
+  the MariaDB mirror only follows writes that already succeeded.
+- **`registrar` column** = "which registrar manages this domain". `sync`
+  marks every zone seen on Cloudflare as `cloudflare`; all operations
+  (`sync`, `update-ip`, `purge`) first select only `registrar=cloudflare`
+  zones. Members that vanish from Cloudflare are deregistered
+  (`registrar → other`, `status → off`) — by `update-ip` within minutes or by
+  the daily `sync`.
+- **`track` flag** (`dns.track_ip`): per-record gate within a managed domain.
+  Default is ON — records serving another server (e.g. `yin-du.com` →
+  50.47.202.72) stay tracked unless you `track ... off`, which is why the
+  flag is the explicit exception mechanism.
+- **Base records**: every managed zone is guaranteed `@`/`www`/`*` A records
+  at the home IP — `init` creates them, `sync` auto-completes any missing
+  one, `update-ip` keeps their content current.
+- **Safe by default**: `--dry-run` on all mutating commands; `dns rm`
+  requires `-y`; no hard deletes (absent things are soft-disabled);
+  multi-source IP detection with 2-of-3 agreement; an advisory flock prevents
+  overlapping runs; all SQL is parameterized.
+- **Migrations** run automatically at startup, each file applied at most
+  once (`schema_migrations`).
+
+## Security
+
+- The legacy PHP code carried your Cloudflare **global API key** and MariaDB
+  password as plaintext. Rotate to a scoped token + a dedicated,
+  low-privilege MariaDB user before exposing this repo further.
+- `/etc/cfddns/cfddns.env` must stay root-only; never commit real secrets
+  (`.env*` are gitignored).

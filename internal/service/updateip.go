@@ -17,12 +17,12 @@ type IPDetector func(ctx context.Context) (netip.Addr, error)
 // updated first; the local mirror follows only after each Cloudflare call
 // succeeds, per the "Cloudflare is the single source of truth" rule.
 type Updater struct {
-	cf        *cf.Client
-	st        *store.Store
-	log       *slog.Logger
-	detect    IPDetector
-	dryRun    bool
-	autoTTL   int // TTL sent to Cloudflare when the mirror has none (1 = auto)
+	cf      *cf.Client
+	st      *store.Store
+	log     *slog.Logger
+	detect  IPDetector
+	dryRun  bool
+	autoTTL int // TTL sent to Cloudflare when the mirror has none (1 = auto)
 }
 
 // NewUpdater builds an IP updater.

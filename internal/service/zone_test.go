@@ -14,7 +14,7 @@ func TestZoneDiffAddsAndRemoves(t *testing.T) {
 	}
 	dbZones := map[string]store.Zone{
 		"b": {ID: 2, Name: "b.com", ZoneID: "b", Status: store.StatusOn, Registrar: "cloudflare"},
-		"c": {ID: 3, Name: "c.com", ZoneID: "c", Status: store.StatusOn, Registrar: "cloudflare"}, // vanished
+		"c": {ID: 3, Name: "c.com", ZoneID: "c", Status: store.StatusOn, Registrar: "cloudflare"},  // vanished
 		"d": {ID: 4, Name: "d.com", ZoneID: "d", Status: store.StatusOff, Registrar: "cloudflare"}, // already off: untouched
 		"e": {ID: 5, Name: "e.com", ZoneID: "e", Status: store.StatusOn, Registrar: "enom"},        // not managed: untouched
 	}

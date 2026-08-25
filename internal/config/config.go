@@ -45,6 +45,10 @@ func envFileCandidates() []string {
 		"/etc/cfddns/cfddns.env",
 		filepath.Join(os.Getenv("HOME"), ".cfddns.env"),
 	)
+	// Windows: %USERPROFILE%\.cfddns.env (HOME is usually unset there).
+	if p := os.Getenv("USERPROFILE"); p != "" {
+		candidates = append(candidates, filepath.Join(p, ".cfddns.env"))
+	}
 	return candidates
 }
 
