@@ -52,7 +52,13 @@ nothing — run it before any real run.
   recorded in `schema_migrations` and applied at most once. MariaDB-only
   syntax (`IF NOT EXISTS`); the target DB is MariaDB 10.11.
 
-## Configuration (environment)
+## Configuration
+
+Values come from the environment, optionally overlaid from the first existing
+env file (dotenv syntax, existing environment variables win): `$CFDDNS_ENV_FILE`
+→ `./.env` → `/etc/cfddns/cfddns.env` → `~/.cfddns.env`. This makes manual
+runs (`cfddns sync`) work without sourcing anything, matching how the systemd
+units inject the same file.
 
 | Variable | Required | Purpose |
 |---|---|---|
