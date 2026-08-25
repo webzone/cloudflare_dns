@@ -3,9 +3,11 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/netip"
 	"os"
@@ -59,6 +61,13 @@ DNS RECORDS
   dns update <zone> <name> [--content X] [--ttl N] [--proxy|--no-proxy] [--prio N]
                               change fields of an existing record
   dns rm <zone> <name> -y     delete a record (Cloudflare + local soft-disable)
+
+TOKEN
+  token                       show token state (masked)
+  token set [<token>]         store a token (prompts if not given); validates
+                              against Cloudflare first; stored owner-only
+  token rm                    remove the stored token
+  token test                  validate the current token
 
 AUTOMATION
   sync                        record Cloudflare zones/records into the local DB;
@@ -169,6 +178,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runInit(ctx, rest[1], o.wildcard, o.dryRun)
 	case "track":
 		return a.runTrack(ctx, rest[1:], o.dryRun)
+	case "token":
+		return a.runToken(ctx, rest[1:])
 	case "purge":
 		zone := ""
 		if len(rest) > 1 {
@@ -216,17 +227,175 @@ func (a *App) open(ctx context.Context) (*cf.Client, *store.Store, func(), error
 	}
 	closeFn := func() { _ = st.Close() }
 
-	var client *cf.Client
-	if a.cfg.CloudflareToken != "" {
-		client, err = cf.New(ctx, a.cfg.CloudflareToken)
-		if err != nil {
-			closeFn()
-			return nil, nil, nil, err
-		}
-	} else {
-		client = cf.NewWithAPIKey(a.cfg.CloudflareEmail, a.cfg.CloudflareKey)
+	client, err := a.cfClient(ctx)
+	if err != nil {
+		closeFn()
+		return nil, nil, nil, err
 	}
 	return client, st, closeFn, nil
+}
+
+// openStore opens only the SQLite store (commands that never call the
+// Cloudflare API: status, zones, track).
+func (a *App) openStore(ctx context.Context) (*store.Store, func(), error) {
+	if missing := a.cfg.CheckDB(); len(missing) > 0 {
+		return nil, nil, fmt.Errorf("missing required env %v", missing)
+	}
+	st, err := store.Open(ctx, a.cfg.DBLocation(), a.log)
+	if err != nil {
+		return nil, nil, err
+	}
+	return st, func() { _ = st.Close() }, nil
+}
+
+// cfClient validates/renews the Cloudflare client. When the token is missing
+// or rejected, an interactive prompt (TTY) captures a new one and stores it;
+// non-interactive runs fail with guidance.
+func (a *App) cfClient(ctx context.Context) (*cf.Client, error) {
+	if a.cfg.CloudflareToken != "" {
+		client, err := cf.New(ctx, a.cfg.CloudflareToken)
+		if err != nil {
+			return a.promptToken(ctx, err)
+		}
+		return client, nil
+	}
+	if a.cfg.CloudflareEmail != "" && a.cfg.CloudflareKey != "" {
+		return cf.NewWithAPIKey(a.cfg.CloudflareEmail, a.cfg.CloudflareKey), nil
+	}
+	return a.promptToken(ctx, nil)
+}
+
+// promptToken prints guidance and, on an interactive terminal, accepts a new
+// token, validates it against Cloudflare and stores it for future runs.
+func (a *App) promptToken(ctx context.Context, invalidErr error) (*cf.Client, error) {
+	if !isTTY() {
+		if invalidErr != nil {
+			return nil, fmt.Errorf("cloudflare auth: %w\n%s", invalidErr, tokenGuidance)
+		}
+		return nil, fmt.Errorf("cloudflare auth is not configured.\n%s", tokenGuidance)
+	}
+	fmt.Println("\nCloudflare API token is missing or invalid.")
+	fmt.Print(tokenGuidance)
+	fmt.Print("Paste the token and press Enter (Ctrl-C aborts): ")
+	reader := bufio.NewReader(os.Stdin)
+	line, _ := reader.ReadString('\n')
+	tok := strings.TrimSpace(line)
+	if tok == "" {
+		return nil, errors.New("no token entered; aborting")
+	}
+	client, err := cf.New(ctx, tok)
+	if err != nil {
+		return nil, fmt.Errorf("token rejected by Cloudflare: %w\n%s", err, tokenGuidance)
+	}
+	if err := config.SaveTokenFile(tok); err != nil {
+		return nil, err
+	}
+	a.cfg.CloudflareToken = tok
+	fmt.Printf("token validated and saved to %s (owner-only)\n", config.TokenFilePath())
+	return client, nil
+}
+
+func isTTY() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// tokenGuidance explains how to create and store a Cloudflare API token.
+const tokenGuidance = `Create a scoped Cloudflare API token:
+  1) open https://dash.cloudflare.com/profile/api-tokens
+  2) Create Token (or start from the "Edit zone DNS" template)
+  3) Permissions:
+       Zone - Zone - Read
+       Zone - DNS - Edit
+       Zone - Cache Purge - Purge
+       Zone - Zone Settings - Read
+     Zone Resources: Include -> All zones
+  4) Create Token, copy the value.
+Store it once:  cfddns token set <the-token>
+`
+
+func maskToken(tok string) string {
+	if len(tok) <= 8 {
+		return "••••••"
+	}
+	return tok[:6] + "••••" + tok[len(tok)-4:]
+}
+
+func (a *App) runToken(ctx context.Context, args []string) error {
+	sub := "show"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
+	case "", "show", "status":
+		if a.cfg.CloudflareToken != "" {
+			src := "environment (CLOUDFLARE_API_TOKEN)"
+			if !hasEnvToken() {
+				src = config.TokenFilePath()
+			}
+			fmt.Printf("cloudflare token: %s (set)\n", maskToken(a.cfg.CloudflareToken))
+			fmt.Printf("source: %s\n", src)
+		} else {
+			fmt.Printf("cloudflare token: not set (%s)\n", config.TokenFilePath())
+			fmt.Print(tokenGuidance)
+		}
+		return nil
+	case "set":
+		tok := ""
+		if len(args) > 1 {
+			tok = strings.TrimSpace(args[1])
+		} else if isTTY() {
+			fmt.Print("Paste the Cloudflare API token (see guidance in `cfddns token`) and press Enter: ")
+			reader := bufio.NewReader(os.Stdin)
+			line, _ := reader.ReadString('\n')
+			tok = strings.TrimSpace(line)
+		} else {
+			in, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				return err
+			}
+			tok = strings.TrimSpace(string(in))
+		}
+		if tok == "" {
+			return errors.New("empty token; usage: cfddns token set <token> (or pipe it on stdin)")
+		}
+		if _, err := cf.New(ctx, tok); err != nil {
+			return fmt.Errorf("token rejected by Cloudflare: %w\n%s", err, tokenGuidance)
+		}
+		if err := config.SaveTokenFile(tok); err != nil {
+			return err
+		}
+		a.cfg.CloudflareToken = tok
+		fmt.Printf("token validated and saved to %s (owner-only)\n", config.TokenFilePath())
+		return nil
+	case "rm", "remove", "clear":
+		if err := config.RemoveTokenFile(); err != nil {
+			return err
+		}
+		if hasEnvToken() {
+			fmt.Println("stored token removed; note: CLOUDFLARE_API_TOKEN is still set in the environment")
+		} else {
+			fmt.Println("token removed")
+		}
+		return nil
+	case "test":
+		if a.cfg.CloudflareToken == "" {
+			fmt.Println("no token configured")
+			fmt.Print(tokenGuidance)
+			return nil
+		}
+		if _, err := cf.New(ctx, a.cfg.CloudflareToken); err != nil {
+			return fmt.Errorf("token invalid: %w\n%s", err, tokenGuidance)
+		}
+		fmt.Println("token valid")
+		return nil
+	default:
+		return fmt.Errorf("unknown token subcommand %q (want set, show, rm, test)", sub)
+	}
+}
+
+func hasEnvToken() bool {
+	return os.Getenv("CLOUDFLARE_API_TOKEN") != ""
 }
 
 func (a *App) runSync(ctx context.Context, dryRun bool) error {
@@ -277,7 +446,7 @@ func (a *App) runTrack(ctx context.Context, args []string, dryRun bool) error {
 		name = args[1]
 	}
 
-	_, st, closeFn, err := a.open(ctx)
+	st, closeFn, err := a.openStore(ctx)
 	if err != nil {
 		return err
 	}
@@ -335,7 +504,7 @@ func (a *App) runPurge(ctx context.Context, zone string, dryRun bool) error {
 // runZones lists zones (optionally a single zone's detail). Zone membership
 // itself is managed on the Cloudflare website; this is a read-only view.
 func (a *App) runZones(ctx context.Context, args []string) error {
-	_, st, closeFn, err := a.open(ctx)
+	st, closeFn, err := a.openStore(ctx)
 	if err != nil {
 		return err
 	}
@@ -666,7 +835,7 @@ func (a *App) dnsRm(ctx context.Context, client *cf.Client, st *store.Store, dz 
 }
 
 func (a *App) runStatus(ctx context.Context) error {
-	_, st, closeFn, err := a.open(ctx)
+	st, closeFn, err := a.openStore(ctx)
 	if err != nil {
 		return err
 	}
@@ -700,11 +869,26 @@ func (a *App) runStatus(ctx context.Context) error {
 
 	fmt.Printf("home IP (detected):  %s\n", homeStr)
 	fmt.Printf("last_known_ip:       %s\n", knownLastIP(last, known))
+	fmt.Printf("cloudflare token:    %s\n", a.tokenState())
 	fmt.Printf("managed zones:       %d  (registrar=cloudflare, status=on)\n", managed)
 	fmt.Printf("other/off zones:     %d\n", off)
 	fmt.Printf("A records tracked:   %d  (managed zones, track=on)\n", tracked)
 	fmt.Printf("A records excepted:  %d  (managed zones, track=off)\n", untracked)
 	return nil
+}
+
+// tokenState describes where the API token currently comes from.
+func (a *App) tokenState() string {
+	if a.cfg.CloudflareToken == "" {
+		return "missing (run `cfddns token set`)"
+	}
+	if hasEnvToken() {
+		return "set (environment)"
+	}
+	if config.HasTokenFile() {
+		return "set (stored: " + config.TokenFilePath() + ")"
+	}
+	return "set"
 }
 
 // --- helpers ---

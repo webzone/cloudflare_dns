@@ -120,6 +120,15 @@ func Load() (*Config, error) {
 		// Standalone default: alongside the working directory.
 		c.DBPath = "cfddns.db"
 	}
+	// Token store fallback: when no token is in the environment, use the
+	// stored one (managed via `cfddns token set`).
+	if c.CloudflareToken == "" {
+		tok, err := LoadTokenFile()
+		if err != nil {
+			return nil, err
+		}
+		c.CloudflareToken = tok
+	}
 
 	lvl := strings.ToLower(getenv("LOG_LEVEL"))
 	if lvl == "" {
@@ -135,17 +144,7 @@ func Load() (*Config, error) {
 	dry := strings.ToLower(getenv("CF_DDNS_DRY_RUN"))
 	c.DryRun = dry == "1" || dry == "true" || dry == "yes"
 
-	if err := c.validate(); err != nil {
-		return nil, err
-	}
 	return c, nil
-}
-
-func (c *Config) validate() error {
-	if c.CloudflareToken == "" && (c.CloudflareEmail == "" || c.CloudflareKey == "") {
-		return fmt.Errorf("missing Cloudflare auth: set CLOUDFLARE_API_TOKEN (preferred) or CLOUDFLARE_API_EMAIL+CLOUDFLARE_API_KEY")
-	}
-	return nil
 }
 
 // CheckDB validates the mirror database path is set.

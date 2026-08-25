@@ -113,13 +113,32 @@ win over the file.
 
 ## Configure
 
-Create a scoped Cloudflare API token (dash.cloudflare.com → My Profile → API
-Tokens → Create Token): permissions `Zone.Zone:Read`, `Zone.DNS:Edit`,
-`Zone.Cache:Purge`, `Zone.Settings:Edit`, resource "All zones".
+### Cloudflare API token — managed by cfddns
+
+You do not need to edit any file. On first run (or when the token is missing
+or invalid) cfddns prints guidance and, in a terminal, asks you to paste the
+token; it validates it against Cloudflare and stores it owner-only:
+
+```sh
+cfddns token set <the-token>         # or just `cfddns token set` (prompts)
+cfddns token                         # show state (masked) + source
+cfddns token test                    # validate the current token
+cfddns token rm                      # remove the stored token
+```
+
+It is stored at `~/.cfddns/token` (Windows: `%USERPROFILE%\.cfddns\token`;
+override with `CFDDNS_TOKEN_FILE`) with 0600 permissions. Environment
+variables are still honored if set — explicit conventions:
+`CLOUDFLARE_API_TOKEN` beats the stored token, which beats the legacy
+`CLOUDFLARE_API_EMAIL` + `CLOUDFLARE_API_KEY`.
+
+Create a token at dash.cloudflare.com → My Profile → API Tokens → Create
+Token with permissions `Zone.Zone:Read`, `Zone.DNS:Edit`, `Zone.Cache:Purge`,
+`Zone.Settings:Edit`, resource "All zones".
+
+### Other settings (all optional)
 
 ```
-CLOUDFLARE_API_TOKEN=<scoped token>     # preferred auth
-# legacy: CLOUDFLARE_API_EMAIL + CLOUDFLARE_API_KEY
 CFDDNS_DB=/var/lib/cfddns/cfddns.db     # SQLite database file (default ./cfddns.db)
 LOG_LEVEL=info                          # debug|info|warn|error
 # CF_DDNS_DRY_RUN=1                     # force dry-run everywhere
