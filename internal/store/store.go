@@ -1,6 +1,6 @@
-// Package store persists the Cloudflare mirror in MariaDB. Cloudflare is the
-// single source of truth; these tables are a denormalized copy keyed by the
-// Cloudflare record ID. All SQL is parameterized.
+// Package store persists the Cloudflare mirror in a single SQLite file.
+// Cloudflare is the single source of truth; these tables are a denormalized
+// copy keyed by the Cloudflare record ID. All SQL is parameterized.
 package store
 
 import (
@@ -10,8 +10,9 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 
-	_ "github.com/go-sql-driver/mysql"
+	_ "modernc.org/sqlite"
 )
 
 //go:embed migrations/*.sql
@@ -61,17 +62,18 @@ type Store struct {
 	log *slog.Logger
 }
 
-// Open connects, pings, and applies pending migrations.
-func Open(ctx context.Context, dsn string, log *slog.Logger) (*Store, error) {
-	db, err := sql.Open("mysql", dsn)
+// Open opens (creating if needed) and migrates the SQLite mirror database.
+func Open(ctx context.Context, path string, log *slog.Logger) (*Store, error) {
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
 	if err != nil {
-		return nil, fmt.Errorf("open mysql: %w", err)
+		return nil, fmt.Errorf("open sqlite %s: %w", path, err)
 	}
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(2)
+	// SQLite is single-writer: keep one connection so concurrent writers
+	// serialize instead of hitting SQLITE_BUSY.
+	db.SetMaxOpenConns(1)
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("ping mysql: %w", err)
+		return nil, fmt.Errorf("ping sqlite %s: %w", path, err)
 	}
 	s := &Store{db: db, log: log}
 	if err := s.migrate(ctx); err != nil {
@@ -88,9 +90,9 @@ func (s *Store) Close() error { return s.db.Close() }
 // schema_migrations.
 func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
-		id varchar(255) NOT NULL PRIMARY KEY,
-		applied_at timestamp NOT NULL DEFAULT current_timestamp()
-	) ENGINE=InnoDB`); err != nil {
+		id TEXT NOT NULL PRIMARY KEY,
+		applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
 
@@ -127,8 +129,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", name, err)
 		}
-		if _, err := s.db.ExecContext(ctx, string(body)); err != nil {
-			return fmt.Errorf("apply migration %s: %w", name, err)
+		for _, stmt := range splitSQL(string(body)) {
+			if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("apply migration %s: %w", name, err)
+			}
 		}
 		if _, err := s.db.ExecContext(ctx, `INSERT INTO schema_migrations (id) VALUES (?)`, name); err != nil {
 			return fmt.Errorf("record migration %s: %w", name, err)
@@ -136,6 +140,34 @@ func (s *Store) migrate(ctx context.Context) error {
 		s.log.Info("migration applied", "migration", name)
 	}
 	return nil
+}
+
+// splitSQL splits a migration file into individual statements. SQLite drivers
+// only execute one statement per Exec; our migrations are plain, so a
+// statement ends at a line whose trimmed content is the statement or ends in
+// ';'. Comment-only and blank lines are dropped.
+func splitSQL(body string) []string {
+	var stmts []string
+	var cur strings.Builder
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "--") {
+			continue
+		}
+		cur.WriteString(line)
+		cur.WriteString("\n")
+		if strings.HasSuffix(trimmed, ";") {
+			stmts = append(stmts, cur.String())
+			cur.Reset()
+		}
+	}
+	if strings.TrimSpace(cur.String()) != "" {
+		stmts = append(stmts, cur.String())
+	}
+	return stmts
 }
 
 // --- zones ---
@@ -296,7 +328,7 @@ func (s *Store) InsertRecord(ctx context.Context, domainID int64, r Record) (int
 
 // UpdateRecord overwrites the mirror fields of an existing row. recordid is
 // set so rows that were previously matched by composite key get their stable
-// Cloudflare identity.
+// Cloudflare identity. The track_ip flag is intentionally left untouched.
 func (s *Store) UpdateRecord(ctx context.Context, dnsID int64, r Record) error {
 	if _, err := s.db.ExecContext(ctx, `
 		UPDATE dns SET type = ?, name = ?, content = ?, proxied = ?, ttl = ?,
@@ -378,23 +410,6 @@ func (s *Store) FindRecordByName(ctx context.Context, domainID int64, name strin
 	return r, true, nil
 }
 
-// ZoneByName finds a zone row by domain name.
-func (s *Store) ZoneByName(ctx context.Context, name string) (Zone, bool, error) {
-	var z Zone
-	// Collation is case-insensitive on utf8mb4_unicode_520_ci, matching how
-	// Cloudflare treats domain equality.
-	err := s.db.QueryRowContext(ctx,
-		`SELECT domainID, domainname, registrar, zoneid, status FROM domain WHERE domainname = ?`,
-		name).Scan(&z.ID, &z.Name, &z.Registrar, &z.ZoneID, &z.Status)
-	if err == sql.ErrNoRows {
-		return Zone{}, false, nil
-	}
-	if err != nil {
-		return Zone{}, false, fmt.Errorf("zone by name %s: %w", name, err)
-	}
-	return z, true, nil
-}
-
 // CountManagedATrack returns how many A records of managed (on,
 // registrar=cloudflare) zones are tracked vs explicitly untracked.
 func (s *Store) CountManagedATrack(ctx context.Context) (tracked, untracked int64, err error) {
@@ -408,6 +423,21 @@ func (s *Store) CountManagedATrack(ctx context.Context) (tracked, untracked int6
 		return 0, 0, fmt.Errorf("count managed A track: %w", err)
 	}
 	return tracked, total - tracked, nil
+}
+
+// ZoneByName finds a zone row by domain name.
+func (s *Store) ZoneByName(ctx context.Context, name string) (Zone, bool, error) {
+	var z Zone
+	err := s.db.QueryRowContext(ctx,
+		`SELECT domainID, domainname, registrar, zoneid, status FROM domain WHERE domainname = ?`,
+		name).Scan(&z.ID, &z.Name, &z.Registrar, &z.ZoneID, &z.Status)
+	if err == sql.ErrNoRows {
+		return Zone{}, false, nil
+	}
+	if err != nil {
+		return Zone{}, false, fmt.Errorf("zone by name %s: %w", name, err)
+	}
+	return z, true, nil
 }
 
 // --- app state ---
@@ -429,7 +459,7 @@ func (s *Store) GetState(ctx context.Context, key string) (string, bool, error) 
 func (s *Store) SetState(ctx context.Context, key, value string) error {
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT INTO app_state (k, v) VALUES (?, ?)
-		 ON DUPLICATE KEY UPDATE v = VALUES(v)`, key, value); err != nil {
+		 ON CONFLICT(k) DO UPDATE SET v = excluded.v`, key, value); err != nil {
 		return fmt.Errorf("set state %s: %w", key, err)
 	}
 	return nil
@@ -442,8 +472,7 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-// nullableTTL maps a 0/absent TTL to NULL (legacy rows may hold NULL; mirror
-// writes persist the numeric value Cloudflare returns, 1 meaning "auto").
+// nullableTTL maps a 0/absent TTL to NULL.
 func nullableTTL(ttl int) any {
 	if ttl <= 0 {
 		return nil

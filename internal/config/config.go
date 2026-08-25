@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -20,11 +19,8 @@ type Config struct {
 	CloudflareEmail string
 	CloudflareKey   string
 
-	MySQLHost string
-	MySQLPort int
-	MySQLUser string
-	MySQLPass string
-	MySQLDB   string
+	// DBPath is the SQLite mirror file (standalone; no external database).
+	DBPath string
 
 	LogLevel LogLevel
 	DryRun   bool
@@ -118,19 +114,11 @@ func Load() (*Config, error) {
 		CloudflareToken: getenv("CLOUDFLARE_API_TOKEN"),
 		CloudflareEmail: getenv("CLOUDFLARE_API_EMAIL"),
 		CloudflareKey:   getenv("CLOUDFLARE_API_KEY"),
-		MySQLHost:       getenv("MYSQL_HOST"),
-		MySQLPort:       3306,
-		MySQLUser:       getenv("MYSQL_USER"),
-		MySQLPass:       getenv("MYSQL_PASSWORD"),
-		MySQLDB:         getenv("MYSQL_DB"),
+		DBPath:          getenv("CFDDNS_DB"),
 	}
-
-	if p := getenv("MYSQL_PORT"); p != "" {
-		n, err := strconv.Atoi(p)
-		if err != nil || n <= 0 || n > 65535 {
-			return nil, fmt.Errorf("invalid MYSQL_PORT %q", p)
-		}
-		c.MySQLPort = n
+	if c.DBPath == "" {
+		// Standalone default: alongside the working directory.
+		c.DBPath = "cfddns.db"
 	}
 
 	lvl := strings.ToLower(getenv("LOG_LEVEL"))
@@ -160,30 +148,16 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// CheckMySQL returns the missing MySQL environment variable names, or nil when
-// all are present. Callers that need the database validate before connecting.
-func (c *Config) CheckMySQL() []string {
-	var missing []string
-	for name, v := range map[string]string{
-		"MYSQL_HOST":     c.MySQLHost,
-		"MYSQL_USER":     c.MySQLUser,
-		"MYSQL_PASSWORD": c.MySQLPass,
-		"MYSQL_DB":       c.MySQLDB,
-	} {
-		if v == "" {
-			missing = append(missing, name)
-		}
+// CheckDB validates the mirror database path is set.
+func (c *Config) CheckDB() []string {
+	if c.DBPath == "" {
+		return []string{"CFDDNS_DB"}
 	}
-	return missing
+	return nil
 }
 
-// MySQLDSN builds the go-sql-driver DSN.
-func (c *Config) MySQLDSN() string {
-	// multiStatements is required by the embedded migration scripts; all other
-	// queries are single, fully parameterized statements.
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_520_ci&multiStatements=true",
-		c.MySQLUser, c.MySQLPass, c.MySQLHost, c.MySQLPort, c.MySQLDB)
-}
+// DBLocation returns the SQLite mirror file path.
+func (c *Config) DBLocation() string { return c.DBPath }
 
 type LogLevel string
 

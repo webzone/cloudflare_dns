@@ -194,10 +194,10 @@ func (a *App) Run(ctx context.Context, args []string) error {
 }
 
 func (a *App) open(ctx context.Context) (*cf.Client, *store.Store, func(), error) {
-	if missing := a.cfg.CheckMySQL(); len(missing) > 0 {
+	if missing := a.cfg.CheckDB(); len(missing) > 0 {
 		return nil, nil, nil, fmt.Errorf("missing required env %v", missing)
 	}
-	st, err := store.Open(ctx, a.cfg.MySQLDSN(), a.log)
+	st, err := store.Open(ctx, a.cfg.DBLocation(), a.log)
 	if err != nil {
 		return nil, nil, nil, err
 	}

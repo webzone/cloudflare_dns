@@ -7,6 +7,11 @@
 .env.local
 cfddns.env
 
+# Local mirror database
+*.db
+*.db-wal
+*.db-shm
+
 # Go
 /vendor/
 

@@ -1,28 +1,33 @@
 # cfddns — Cloudflare DNS mirror & domain management
 
-A single static Go binary that replaces the legacy PHP scripts
-(`updateDNS.php`, `getDomains.php`, `setZoneSettings.php`,
-`purge_all_caches.php`). It keeps a local MariaDB mirror of your Cloudflare
-DNS and manages your records: dynamic-DNS IP updates, per-record
-home-IP tracking, and a full DNS management CLI.
+A single static Go binary with two jobs:
 
-**Cloudflare is the single source of truth.** Zones are added/removed **only
-on the Cloudflare website** (dash.cloudflare.com) — cfddns never creates or
-deletes zones; it detects zone changes and reacts (initializes new zones,
-deregisters zones that vanished).
+1. **Domain management** — `zones`, `dns` (list/add/update/rm), `track`,
+   `init`, `sync`, `purge`.
+2. **Dynamic IP update** — `update-ip` keeps your A records pointing at
+   your current public IP.
 
-- Linux / macOS / Windows binaries built from one codebase (static, no runtime
-  dependencies beyond network + optional MariaDB).
+Cloudflare is the single source of truth: a local **SQLite file** mirrors
+your DNS so every command works fast and offline-friendly, with **no
+external database server**. The binary is standalone (Linux / macOS / Windows,
+static, CGO-free) — only network access, a Cloudflare API token, and an
+optional SQLite file path are needed.
+
+Zones are added/removed **only on the Cloudflare website**
+(dash.cloudflare.com) — cfddns never creates or deletes zones; it detects
+zone changes and reacts (initializes new zones, deregisters zones that
+vanished).
 
 ## Features
 
 - `update-ip` — dynamic DNS. Detects your public IP once per run (3
   independent sources, 2 must agree), moves every tracked A record to it
-  (Cloudflare first, mirror after each success), zero API calls when the IP
-  is unchanged. Also reconciles the zone set each run.
-- `sync` — mirrors all Cloudflare zones/records into MariaDB; marks present
-  zones `registrar=cloudflare`; auto-creates any missing `@`/`www`/`*` A
-  records at the home IP.
+  (Cloudflare first, mirror after each success), **zero API calls** when
+  the IP is unchanged. Also reconciles the zone set: new zones get
+  initialized, zones that vanished get deregistered.
+- `sync` — mirrors all Cloudflare zones/records into the SQLite mirror;
+  marks present zones `registrar=cloudflare`; auto-creates any missing
+  `@`/`www`/`*` A records at the home IP.
 - `track` — per-record "follow the home IP" flag. **Default is managed**:
   every A record of a managed zone follows the home IP unless explicitly
   untracked.
@@ -31,19 +36,15 @@ deregisters zones that vanished).
 
 ## Install
 
-No package manager yet — build from source (Go ≥ 1.21) or copy a prebuilt
-binary. The tool is fully static; only `CF_DDNS_TEST_IP`-style env config and
-(optionally) MariaDB are needed.
-
-### Build for your platform
+Build from source (Go ≥ 1.21) — the result is a static standalone binary:
 
 ```sh
 git clone git@github.com:webzone/cloudflare_dns.git   # private repo
 cd cloudflare_dns
-go build -o cfddns ./cmd/cfddns                       # matches your OS/arch
+go build -o cfddns ./cmd/cfddns                       # your OS/arch
 ```
 
-Cross-compile matrix (each produces a standalone binary):
+Cross-compile (each produces a standalone binary):
 
 ```sh
 GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o cfddns-linux-amd64  ./cmd/cfddns
@@ -53,15 +54,15 @@ GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -o cfddns-darw
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o cfddns.exe           ./cmd/cfddns
 ```
 
-Place it anywhere on `PATH` (`sudo install -m 0755 cfddns /usr/local/bin/`).
+Put it on `PATH` (`sudo install -m 0755 cfddns /usr/local/bin/`).
 
-### Linux server (recommended: systemd timers)
+### Linux server with systemd timers (recommended)
 
 ```sh
-sudo mkdir -p /etc/cfddns /var/log/cfddns
+sudo mkdir -p /etc/cfddns /var/log/cfddns /var/lib/cfddns
 sudo install -m 0600 -o root -g root deploy/cfddns.env.example /etc/cfddns/cfddns.env
 sudo install -m 0644 deploy/logrotate/cfddns /etc/logrotate.d/cfddns
-# 1. fill /etc/cfddns/cfddns.env with your real credentials (below)
+# 1. edit /etc/cfddns/cfddns.env: real credentials + CFDDNS_DB path
 # 2. install units:
 sudo install -m 0644 deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -69,53 +70,45 @@ sudo systemctl enable --now cfddns-update.timer cfddns-sync.timer
 tail -f /var/log/cfddns/cfddns.log
 ```
 
-- `cfddns-update.timer`: every 5 minutes (2 min after boot).
+- `cfddns-update.timer`: dynamic-IP update every 5 minutes (2 min after boot).
 - `cfddns-sync.timer`: daily 04:00 (`Persistent`, catches up after downtime).
 
-Scheduling without systemd: cron / launchd / Task Scheduler calling
-`cfddns update-ip` every 5 minutes and `cfddns sync` daily work the same way
-(the binary has its own overlap lock).
+Other schedulers work identically (cron, launchd, Task Scheduler calling
+`cfddns update-ip` every 5 minutes + `cfddns sync` daily); the binary has its
+own overlap lock.
 
-### macOS / Windows (workstation or any always-on box)
+### macOS / Windows
 
 ```sh
-# one-time: configure
-cp deploy/cfddns.env.example ~/.cfddns.env      # macOS/Linux
-# Windows: %USERPROFILE%\.cfddns.env
-# fill with your credentials (below), then:
-cfddns status                                    # verify auth + mirror
-cfddns --dry-run sync                            # preview before first real run
+cp deploy/cfddns.env.example ~/.cfddns.env   # Windows: %USERPROFILE%\.cfddns.env
+# fill with credentials + CFDDNS_DB (Windows example: C:\Data\cfddns.db)
+cfddns status        # verify auth + mirror
+cfddns --dry-run sync
 cfddns sync
-# schedule manually (launchd / Task Scheduler / cron): cfddns update-ip
+# schedule cfddns update-ip (launchd / Task Scheduler)
 ```
 
-`/etc/cfddns/cfddns.env` is Linux-specific; on any OS the env-file lookup is:
-`$CFDDNS_ENV_FILE` → `./.env` → `/etc/cfddns/cfddns.env` (if readable) →
-`~/.cfddns.env` (`%USERPROFILE%\.cfddns.env` on Windows). Already-set
-environment variables always win over the file.
+Env-file lookup order: `$CFDDNS_ENV_FILE` → `./.env` →
+`/etc/cfddns/cfddns.env` (Linux; if readable) → `~/.cfddns.env`
+(`%USERPROFILE%\.cfddns.env` on Windows). Already-set environment variables
+win over the file.
 
 ## Configure
 
 Create a scoped Cloudflare API token (dash.cloudflare.com → My Profile → API
-Tokens → Create Token): permissions `Zone.Zone:Read`,
-`Zone.DNS:Edit`, `Zone.Cache:Purge`, `Zone.Settings:Edit`, resource
-"All zones". Also create the MariaDB user/database for the mirror.
+Tokens → Create Token): permissions `Zone.Zone:Read`, `Zone.DNS:Edit`,
+`Zone.Cache:Purge`, `Zone.Settings:Edit`, resource "All zones".
 
 ```
-CLOUDFLARE_API_TOKEN=<scoped token>          # preferred auth
+CLOUDFLARE_API_TOKEN=<scoped token>     # preferred auth
 # legacy: CLOUDFLARE_API_EMAIL + CLOUDFLARE_API_KEY
-MYSQL_HOST=192.168.2.246                     # mirror database
-MYSQL_PORT=3306
-MYSQL_USER=domain
-MYSQL_PASSWORD=...
-MYSQL_DB=domain
-LOG_LEVEL=info                               # debug|info|warn|error
-# CF_DDNS_DRY_RUN=1                          # force dry-run everywhere
-# CF_DDNS_TEST_IP=1.2.3.4                    # testing only (with --dry-run)
+CFDDNS_DB=/var/lib/cfddns/cfddns.db     # SQLite mirror file (default ./cfddns.db)
+LOG_LEVEL=info                          # debug|info|warn|error
+# CF_DDNS_DRY_RUN=1                     # force dry-run everywhere
+# CF_DDNS_TEST_IP=1.2.3.4               # testing only (with --dry-run)
 ```
 
-The mirror schema (and all migrations) are created automatically on first
-run; no manual DDL. MariaDB ≥ 10.5 or MySQL ≥ 8 recommended.
+The mirror schema is created automatically on first run — no manual DDL.
 
 ## Command reference
 
@@ -153,7 +146,7 @@ cfddns dns rm example.com www -y
 ### Automation
 
 ```sh
-cfddns sync                                  # mirror CF → DB (idempotent)
+cfddns sync                                  # mirror CF -> SQLite (idempotent)
 cfddns update-ip                             # dynamic DNS + zone reconcile
 cfddns init example.com [--wildcard]         # base @/www (+ *) at home IP
 cfddns track example.com on|off              # whole zone follows home IP
@@ -165,17 +158,16 @@ cfddns status                                # overview
 ## How it works
 
 - **Single source of truth**: every operation reads/writes Cloudflare first;
-  the MariaDB mirror only follows writes that already succeeded.
+  the SQLite mirror only follows writes that already succeeded.
 - **`registrar` column** = "which registrar manages this domain". `sync`
   marks every zone seen on Cloudflare as `cloudflare`; all operations
   (`sync`, `update-ip`, `purge`) first select only `registrar=cloudflare`
   zones. Members that vanish from Cloudflare are deregistered
-  (`registrar → other`, `status → off`) — by `update-ip` within minutes or by
+  (`registrar -> other`, `status -> off`) by `update-ip` within minutes or by
   the daily `sync`.
 - **`track` flag** (`dns.track_ip`): per-record gate within a managed domain.
-  Default is ON — records serving another server (e.g. `yin-du.com` →
-  50.47.202.72) stay tracked unless you `track ... off`, which is why the
-  flag is the explicit exception mechanism.
+  Default is ON — records serving another server stay tracked unless you
+  `track ... off`, which is the explicit exception mechanism.
 - **Base records**: every managed zone is guaranteed `@`/`www`/`*` A records
   at the home IP — `init` creates them, `sync` auto-completes any missing
   one, `update-ip` keeps their content current.
@@ -188,8 +180,8 @@ cfddns status                                # overview
 
 ## Security
 
-- The legacy PHP code carried your Cloudflare **global API key** and MariaDB
-  password as plaintext. Rotate to a scoped token + a dedicated,
-  low-privilege MariaDB user before exposing this repo further.
-- `/etc/cfddns/cfddns.env` must stay root-only; never commit real secrets
-  (`.env*` are gitignored).
+- Use a scoped API token, never the account global key.
+- The SQLite mirror contains a copy of your DNS but no Cloudflare secrets;
+  `/etc/cfddns/cfddns.env` must stay root-only, and the database file should
+  be owner-only.
+- Never commit real secrets (`.env*` and `*.db` are gitignored).
