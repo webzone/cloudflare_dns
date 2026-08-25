@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Cloudflare -> DB mirror sync
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+Unit=cfddns-sync.service
+
+[Install]
+WantedBy=timers.target

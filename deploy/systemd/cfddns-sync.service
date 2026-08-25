@@ -1,0 +1,15 @@
+[Unit]
+Description=cfddns Cloudflare -> DB mirror sync
+Documentation=https://github.com/webzone/cloudflare_dns
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+Group=user
+ExecStart=/usr/local/bin/cfddns sync
+EnvironmentFile=/etc/cfddns/cfddns.env
+StandardOutput=append:/var/log/cfddns/cfddns.log
+StandardError=append:/var/log/cfddns/cfddns.log
+TimeoutStartSec=120

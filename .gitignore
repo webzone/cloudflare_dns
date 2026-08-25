@@ -1,0 +1,15 @@
+# Binaries
+/cfddns
+*.exe
+
+# Local dev secrets — never commit
+.env
+.env.local
+cfddns.env
+
+# Go
+/vendor/
+
+# Editor/OS
+.DS_Store
+*.swp

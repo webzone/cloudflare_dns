@@ -1,0 +1,16 @@
+[Unit]
+Description=cfddns dynamic-DNS IP update
+Documentation=https://github.com/webzone/cloudflare_dns
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+Group=user
+ExecStart=/usr/local/bin/cfddns update-ip
+EnvironmentFile=/etc/cfddns/cfddns.env
+# journald stdout capture is unreliable on this box, so logs go to a file
+StandardOutput=append:/var/log/cfddns/cfddns.log
+StandardError=append:/var/log/cfddns/cfddns.log
+TimeoutStartSec=120
