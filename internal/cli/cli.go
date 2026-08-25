@@ -32,7 +32,7 @@ func New(cfg *config.Config, log *slog.Logger) *App {
 }
 
 // Usage is the top-level help text.
-var Usage = `cfddns — Cloudflare DNS mirror & domain management
+var Usage = `cfddns — Cloudflare domain management & dynamic IP update
 
 Zones (domains) are added/removed ONLY on the Cloudflare website
 (dash.cloudflare.com). cfddns reads the zone list and manages the DNS
@@ -42,34 +42,34 @@ USAGE
   cfddns [--dry-run] <command> [args]
 
 ZONES (read-only view)
-  zones                       list zones from the mirror (name, zone id,
+  zones                       list zones from the local DB (name, zone id,
                               registrar, status, record count)
   zones <zone>                zone detail (registrar, status, record counts)
 
 DNS RECORDS
-  dns <zone> [--type TYPE]    list records of a zone from the mirror, with
+  dns <zone> [--type TYPE]    list records of a zone from the local DB, with
                               the track column (run sync first if stale)
   dns add <zone> <TYPE> <name> <content> [--ttl N] [--proxy|--no-proxy] [--prio N]
                               create a record of type A/AAAA/CNAME/MX/TXT.
                               A records of managed zones are tracked by default
   dns update <zone> <name> [--content X] [--ttl N] [--proxy|--no-proxy] [--prio N]
                               change fields of an existing record
-  dns rm <zone> <name> -y     delete a record (Cloudflare + mirror soft-disable)
+  dns rm <zone> <name> -y     delete a record (Cloudflare + local soft-disable)
 
 AUTOMATION
-  sync                        mirror Cloudflare zones/records into the DB;
+  sync                        record Cloudflare zones/records into the local DB;
                               mark present zones registrar=cloudflare;
                               auto-create any missing @/www/* A record
   update-ip                   reconcile zone set (init new, deregister zones
                               that vanished), then move tracked A records to
-                              the home IP (Cloudflare first, mirror after)
+                              the home IP (Cloudflare first, local DB after)
   init <zone> [--wildcard]    initialize a zone the owner added on CF:
                               base A records (@, www [+ *]) at the home IP
   track <zone> [name] on|off  mark A record(s) as following (on) or not
                               following (off) the home IP; name can be
                               @, *, www or any FQDN (no name = whole zone)
   purge [zone]                purge edge cache of all/one managed zone
-  status                      overview: home IP, mirror state, track counts
+  status                      overview: home IP, local DB state, track counts
 
 LEGACY
   inspect zones | records <z> aliases of ` + "`zones` / `dns <z>`" + `
@@ -275,7 +275,7 @@ func (a *App) runTrack(ctx context.Context, args []string, dryRun bool) error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("zone %q not in the mirror; run `cfddns sync` first", zone)
+		return fmt.Errorf("zone %q not in the local DB; run `cfddns sync` first", zone)
 	}
 
 	if name == "" {
@@ -334,7 +334,7 @@ func (a *App) runZones(ctx context.Context, args []string) error {
 			return err
 		}
 		if !ok {
-			return fmt.Errorf("zone %q not in the mirror; run `cfddns sync` or add it in the Cloudflare dashboard", args[0])
+			return fmt.Errorf("zone %q not in the local DB; run `cfddns sync` or add it in the Cloudflare dashboard", args[0])
 		}
 		recs, err := st.ListRecords(ctx, dz.ID)
 		if err != nil {
@@ -363,7 +363,7 @@ func (a *App) runZones(ctx context.Context, args []string) error {
 		fmt.Printf("status:      %s\n", dz.Status)
 		fmt.Printf("records:     %s\n", strings.Join(types, " "))
 		if off > 0 {
-			fmt.Printf("(plus %d disabled records in the mirror)\n", off)
+			fmt.Printf("(plus %d disabled records in the local DB)\n", off)
 		}
 		fmt.Printf("tracked A:   %d\n", tracked)
 		return nil
@@ -437,7 +437,7 @@ func (a *App) runDNS(ctx context.Context, args []string, o cmdOpts) error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("zone %q not in the mirror; run `cfddns sync` first", zone)
+		return fmt.Errorf("zone %q not in the local DB; run `cfddns sync` first", zone)
 	}
 	if dz.ZoneID == "" {
 		return fmt.Errorf("zone %q has no Cloudflare zone id; run `cfddns sync`", zone)
@@ -648,7 +648,7 @@ func (a *App) dnsRm(ctx context.Context, client *cf.Client, st *store.Store, dz 
 	if err := st.SetRecordStatus(ctx, dr.ID, store.StatusOff); err != nil {
 		return err
 	}
-	fmt.Printf("deleted %s %s (%s); mirror soft-disabled\n", dr.Type, dr.Name, dr.Content)
+	fmt.Printf("deleted %s %s (%s); local row soft-disabled\n", dr.Type, dr.Name, dr.Content)
 	return nil
 }
 

@@ -1,4 +1,4 @@
-# cfddns — Cloudflare DNS mirror & domain management
+# cfddns — Cloudflare domain management & dynamic IP update
 
 A single static Go binary with two jobs:
 
@@ -7,11 +7,12 @@ A single static Go binary with two jobs:
 2. **Dynamic IP update** — `update-ip` keeps your A records pointing at
    your current public IP.
 
-Cloudflare is the single source of truth: a local **SQLite file** mirrors
-your DNS so every command works fast and offline-friendly, with **no
-external database server**. The binary is standalone (Linux / macOS / Windows,
-static, CGO-free) — only network access, a Cloudflare API token, and an
-optional SQLite file path are needed.
+Cloudflare is the single source of truth; every command works straight
+against the live API, and all state (zones, records, flags, last-known IP)
+is recorded in a single local **SQLite file** — fast, offline-friendly, with
+no external database server. The binary is standalone (Linux / macOS /
+Windows, static, CGO-free) — only network access, a Cloudflare API token,
+and an optional SQLite file path are needed.
 
 Zones are added/removed **only on the Cloudflare website**
 (dash.cloudflare.com) — cfddns never creates or deletes zones; it detects
@@ -22,11 +23,11 @@ vanished).
 
 - `update-ip` — dynamic DNS. Detects your public IP once per run (3
   independent sources, 2 must agree), moves every tracked A record to it
-  (Cloudflare first, mirror after each success), **zero API calls** when
+  (Cloudflare first, local DB after each success), **zero API calls** when
   the IP is unchanged. Also reconciles the zone set: new zones get
   initialized, zones that vanished get deregistered.
-- `sync` — mirrors all Cloudflare zones/records into the SQLite mirror;
-  marks present zones `registrar=cloudflare`; auto-creates any missing
+- `sync` — records all Cloudflare zones and records into the local SQLite
+  store; marks present zones `registrar=cloudflare`; auto-creates any missing
   `@`/`www`/`*` A records at the home IP.
 - `track` — per-record "follow the home IP" flag. **Default is managed**:
   every A record of a managed zone follows the home IP unless explicitly
@@ -82,7 +83,7 @@ own overlap lock.
 ```sh
 cp deploy/cfddns.env.example ~/.cfddns.env   # Windows: %USERPROFILE%\.cfddns.env
 # fill with credentials + CFDDNS_DB (Windows example: C:\Data\cfddns.db)
-cfddns status        # verify auth + mirror
+cfddns status        # verify auth + local DB
 cfddns --dry-run sync
 cfddns sync
 # schedule cfddns update-ip (launchd / Task Scheduler)
@@ -102,13 +103,13 @@ Tokens → Create Token): permissions `Zone.Zone:Read`, `Zone.DNS:Edit`,
 ```
 CLOUDFLARE_API_TOKEN=<scoped token>     # preferred auth
 # legacy: CLOUDFLARE_API_EMAIL + CLOUDFLARE_API_KEY
-CFDDNS_DB=/var/lib/cfddns/cfddns.db     # SQLite mirror file (default ./cfddns.db)
+CFDDNS_DB=/var/lib/cfddns/cfddns.db     # SQLite database file (default ./cfddns.db)
 LOG_LEVEL=info                          # debug|info|warn|error
 # CF_DDNS_DRY_RUN=1                     # force dry-run everywhere
 # CF_DDNS_TEST_IP=1.2.3.4               # testing only (with --dry-run)
 ```
 
-The mirror schema is created automatically on first run — no manual DDL.
+The SQLite schema is created automatically on first run — no manual DDL.
 
 ## Command reference
 
@@ -128,25 +129,25 @@ cfddns zones example.com      # detail: registrar, status, record counts, tracke
 ```sh
 cfddns dns example.com [--type A] [--all]
 #   live records (type/name/content/ttl/proxy/track); --all includes
-#   soft-disabled mirror history
+#   soft-disabled history in the local DB
 
 cfddns dns add example.com A www 1.2.3.4 [--ttl 300] [--proxy|--no-proxy]
 cfddns dns add example.com MX @ mail.example.com --prio 10
 cfddns dns add example.com TXT _dmarc "v=DMARC1; p=none"
 #   supported types: A, AAAA, CNAME, MX, TXT. Writes Cloudflare first, then
-#   mirrors. A records of managed zones are born track=on.
+#   records them in the local DB. A records of managed zones are born track=on.
 
 cfddns dns update example.com www --content 5.6.7.8 [--ttl 300] [--no-proxy]
 #   change content / ttl / proxy / prio; track flag is preserved
 
 cfddns dns rm example.com www -y
-#   deletes the record on Cloudflare; the mirror row is soft-disabled
+#   deletes the record on Cloudflare; the local row is soft-disabled
 ```
 
 ### Automation
 
 ```sh
-cfddns sync                                  # mirror CF -> SQLite (idempotent)
+cfddns sync                                  # align the local DB with Cloudflare (idempotent)
 cfddns update-ip                             # dynamic DNS + zone reconcile
 cfddns init example.com [--wildcard]         # base @/www (+ *) at home IP
 cfddns track example.com on|off              # whole zone follows home IP
@@ -158,7 +159,7 @@ cfddns status                                # overview
 ## How it works
 
 - **Single source of truth**: every operation reads/writes Cloudflare first;
-  the SQLite mirror only follows writes that already succeeded.
+  the local SQLite store only records writes that already succeeded.
 - **`registrar` column** = "which registrar manages this domain". `sync`
   marks every zone seen on Cloudflare as `cloudflare`; all operations
   (`sync`, `update-ip`, `purge`) first select only `registrar=cloudflare`
@@ -181,7 +182,7 @@ cfddns status                                # overview
 ## Security
 
 - Use a scoped API token, never the account global key.
-- The SQLite mirror contains a copy of your DNS but no Cloudflare secrets;
+- The SQLite store contains a copy of your DNS but no Cloudflare secrets;
   `/etc/cfddns/cfddns.env` must stay root-only, and the database file should
   be owner-only.
 - Never commit real secrets (`.env*` and `*.db` are gitignored).
