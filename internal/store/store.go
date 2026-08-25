@@ -385,8 +385,10 @@ func (s *Store) SetZoneTrackARecords(ctx context.Context, domainID int64, track 
 	return n, nil
 }
 
-// FindRecordByName returns the mirror row for a host name (FQDN) in a domain,
-// regardless of record type.
+// FindRecordByName returns the first mirror row for a host name (FQDN) in a
+// domain, regardless of record type. Note: zones may legitimately have
+// multiple records with the same name (dual-A), so callers that need an
+// unambiguous target should use RecordsByName and disambiguate by content.
 func (s *Store) FindRecordByName(ctx context.Context, domainID int64, name string) (Record, bool, error) {
 	var r Record
 	var proxied, track int
@@ -401,6 +403,60 @@ func (s *Store) FindRecordByName(ctx context.Context, domainID int64, name strin
 	}
 	if err != nil {
 		return Record{}, false, fmt.Errorf("record by name %s domain %d: %w", name, domainID, err)
+	}
+	r.Proxied = proxied != 0
+	r.TrackIP = track != 0
+	if ttl.Valid {
+		r.TTL = int(ttl.Int64)
+	}
+	return r, true, nil
+}
+
+// RecordsByName returns every mirror row matching a host name (FQDN) in a
+// domain — a name can carry multiple records (e.g. dual-A), so the full list
+// lets callers disambiguate.
+func (s *Store) RecordsByName(ctx context.Context, domainID int64, name string) ([]Record, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT dnsid, domain_id, type, name, content, proxied, ttl, priority, status, recordid, track_ip
+		FROM dns WHERE domain_id = ? AND LOWER(name) = LOWER(?)`, domainID, name)
+	if err != nil {
+		return nil, fmt.Errorf("records by name %s domain %d: %w", name, domainID, err)
+	}
+	defer rows.Close()
+	var out []Record
+	for rows.Next() {
+		var r Record
+		var proxied, track int
+		var ttl sql.NullInt64
+		if err := rows.Scan(&r.ID, &r.DomainID, &r.Type, &r.Name, &r.Content, &proxied, &ttl,
+			&r.Priority, &r.Status, &r.RecordID, &track); err != nil {
+			return nil, fmt.Errorf("scan record by name: %w", err)
+		}
+		r.Proxied = proxied != 0
+		r.TrackIP = track != 0
+		if ttl.Valid {
+			r.TTL = int(ttl.Int64)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// FindRecordByCFID returns the mirror row for a Cloudflare record ID.
+func (s *Store) FindRecordByCFID(ctx context.Context, domainID int64, cfID string) (Record, bool, error) {
+	var r Record
+	var proxied, track int
+	var ttl sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT dnsid, domain_id, type, name, content, proxied, ttl, priority, status, recordid, track_ip
+		FROM dns WHERE domain_id = ? AND recordid = ?`, domainID, cfID).
+		Scan(&r.ID, &r.DomainID, &r.Type, &r.Name, &r.Content, &proxied, &ttl,
+			&r.Priority, &r.Status, &r.RecordID, &track)
+	if err == sql.ErrNoRows {
+		return Record{}, false, nil
+	}
+	if err != nil {
+		return Record{}, false, fmt.Errorf("record by id %s domain %d: %w", cfID, domainID, err)
 	}
 	r.Proxied = proxied != 0
 	r.TrackIP = track != 0

@@ -59,8 +59,14 @@ DNS RECORDS
                               create a record of type A/AAAA/CNAME/MX/TXT.
                               A records of managed zones are tracked by default
   dns update <zone> <name> [--content X] [--ttl N] [--proxy|--no-proxy] [--prio N]
-                              change fields of an existing record
-  dns rm <zone> <name> -y     delete a record (Cloudflare + local soft-disable)
+                              change fields of an existing record; for
+                              same-name dual records use the record id:
+                              dns update <zone> <record-id> --content X
+  dns rm <zone> <name> [content] -y
+                              delete a record (Cloudflare + local
+                              soft-disable); an IP or the record id picks
+                              one of same-name dual records, otherwise an
+                              error lists the candidates
 
 TOKEN
   token                       show token state (masked)
@@ -652,12 +658,22 @@ func (a *App) runDNS(ctx context.Context, args []string, o cmdOpts) error {
 	switch sub {
 	case "":
 		return a.listZoneRecords(ctx, st, dz, o.typ, o.all)
+	case "add", "update", "rm":
+		// positional payload follows sub+zone in both spellings.
+		return a.dnsSub(ctx, client, st, dz, sub, args[2:], o)
+	}
+	return nil
+}
+
+// dnsSub dispatches the record mutation after (sub, zone) are consumed.
+func (a *App) dnsSub(ctx context.Context, client *cf.Client, st *store.Store, dz store.Zone, sub string, payload []string, o cmdOpts) error {
+	switch sub {
 	case "add":
-		return a.dnsAdd(ctx, client, st, dz, args[len(args)-3:], o)
+		return a.dnsAdd(ctx, client, st, dz, payload, o)
 	case "update":
-		return a.dnsUpdate(ctx, client, st, dz, args[len(args)-1:], o)
+		return a.dnsUpdate(ctx, client, st, dz, payload, o)
 	case "rm":
-		return a.dnsRm(ctx, client, st, dz, args[len(args)-1:], o)
+		return a.dnsRm(ctx, client, st, dz, payload, o)
 	}
 	return nil
 }
@@ -773,13 +789,9 @@ func (a *App) dnsUpdate(ctx context.Context, client *cf.Client, st *store.Store,
 	if len(args) != 1 {
 		return errors.New("usage: cfddns dns update <zone> <name> [--content X] [--ttl N] [--proxy|--no-proxy] [--prio N]")
 	}
-	target := service.FQDNHost(args[0], dz.Name)
-	dr, ok, err := st.FindRecordByName(ctx, dz.ID, target)
+	dr, err := resolveRecord(ctx, st, dz, args[0], "")
 	if err != nil {
 		return err
-	}
-	if !ok {
-		return fmt.Errorf("no record %q in zone %s", target, dz.Name)
 	}
 
 	rec := cf.Record{ID: dr.RecordID, ZoneID: dz.ZoneID, Type: dr.Type, Name: dr.Name,
@@ -830,19 +842,19 @@ func (a *App) dnsUpdate(ctx context.Context, client *cf.Client, st *store.Store,
 }
 
 func (a *App) dnsRm(ctx context.Context, client *cf.Client, st *store.Store, dz store.Zone, args []string, o cmdOpts) error {
-	if len(args) != 1 {
-		return errors.New("usage: cfddns dns rm <zone> <name> -y")
+	if len(args) < 1 || len(args) > 2 {
+		return errors.New("usage: cfddns dns rm <zone> <name> [content] -y")
 	}
 	if !o.yes {
 		return errors.New("this deletes a Cloudflare record; pass -y to confirm")
 	}
-	target := service.FQDNHost(args[0], dz.Name)
-	dr, ok, err := st.FindRecordByName(ctx, dz.ID, target)
+	content := ""
+	if len(args) == 2 {
+		content = args[1]
+	}
+	dr, err := resolveRecord(ctx, st, dz, args[0], content)
 	if err != nil {
 		return err
-	}
-	if !ok {
-		return fmt.Errorf("no record %q in zone %s", target, dz.Name)
 	}
 	if o.dryRun {
 		fmt.Printf("would delete %s %s (%s)\n", dr.Type, dr.Name, dr.Content)
@@ -856,6 +868,77 @@ func (a *App) dnsRm(ctx context.Context, client *cf.Client, st *store.Store, dz 
 	}
 	fmt.Printf("deleted %s %s (%s); local row soft-disabled\n", dr.Type, dr.Name, dr.Content)
 	return nil
+}
+
+// resolveRecord pins a single live mirror record from a Cloudflare record ID
+// (32-hex) or a host name. When the name carries several records, an optional
+// content value disambiguates; otherwise an error lists the candidates.
+func resolveRecord(ctx context.Context, st *store.Store, dz store.Zone, target, content string) (store.Record, error) {
+	if isCFRecordID(target) {
+		rec, ok, err := st.FindRecordByCFID(ctx, dz.ID, target)
+		if err != nil {
+			return store.Record{}, err
+		}
+		if !ok {
+			return store.Record{}, fmt.Errorf("no record with id %q in zone %s", target, dz.Name)
+		}
+		if rec.Status != store.StatusOn {
+			return store.Record{}, fmt.Errorf("record %s is already disabled", target)
+		}
+		return rec, nil
+	}
+
+	name := service.FQDNHost(target, dz.Name)
+	recs, err := st.RecordsByName(ctx, dz.ID, name)
+	if err != nil {
+		return store.Record{}, err
+	}
+	var live []store.Record
+	for _, r := range recs {
+		if r.Status == store.StatusOn {
+			live = append(live, r)
+		}
+	}
+	if content != "" {
+		var filtered []store.Record
+		for _, r := range live {
+			if r.Content == content {
+				filtered = append(filtered, r)
+			}
+		}
+		live = filtered
+	}
+	switch len(live) {
+	case 0:
+		if content != "" {
+			return store.Record{}, fmt.Errorf("no record %q with content %q in zone %s", name, content, dz.Name)
+		}
+		return store.Record{}, fmt.Errorf("no record %q in zone %s", name, dz.Name)
+	case 1:
+		return live[0], nil
+	default:
+		var cands []string
+		for _, r := range live {
+			cands = append(cands, fmt.Sprintf("%s (%s)", r.Content, r.RecordID))
+		}
+		return store.Record{}, fmt.Errorf("multiple records at %q in %s: %s — pass the record id or add the content to disambiguate",
+			name, dz.Name, strings.Join(cands, ", "))
+	}
+}
+
+// isCFRecordID reports whether s looks like a Cloudflare record ID (32 hex).
+func isCFRecordID(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (a *App) runStatus(ctx context.Context) error {
