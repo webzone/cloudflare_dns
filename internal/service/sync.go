@@ -118,6 +118,14 @@ func (s *Sync) syncZone(ctx context.Context, z cf.Zone, dbZones map[string]store
 				}
 			}
 		}
+		if dz.Registrar != "cloudflare" {
+			s.logAction("zone", "registrar", fmt.Sprintf("%s -> cloudflare (DNS managed on Cloudflare)", z.Name))
+			if !s.dryRun {
+				if err := s.st.SetZoneRegistrar(ctx, dz.ID, "cloudflare"); err != nil {
+					return err
+				}
+			}
+		}
 	case !hasID && byName[z.Name].ID != 0:
 		// Legacy row existed by name without (or with a stale) zone ID.
 		nz := byName[z.Name]
@@ -126,6 +134,9 @@ func (s *Sync) syncZone(ctx context.Context, z cf.Zone, dbZones map[string]store
 		res.ZonesAttached++
 		if !s.dryRun {
 			if err := s.st.SetZoneID(ctx, nz.ID, z.ID); err != nil {
+				return err
+			}
+			if err := s.st.SetZoneRegistrar(ctx, nz.ID, "cloudflare"); err != nil {
 				return err
 			}
 		}

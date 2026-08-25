@@ -169,7 +169,8 @@ func (s *Store) ListTrackedARecords(ctx context.Context) ([]HomeRecord, error) {
 		       d.ttl, d.priority, d.status, d.recordid, d.track_ip, dm.zoneid
 		FROM dns d JOIN domain dm ON dm.domainID = d.domain_id
 		WHERE d.type = 'A' AND d.status = 'on' AND dm.status = 'on'
-		  AND dm.zoneid <> '' AND d.recordid <> '' AND d.track_ip = 1`)
+		  AND dm.registrar = 'cloudflare' AND dm.zoneid <> ''
+		  AND d.recordid <> '' AND d.track_ip = 1`)
 	if err != nil {
 		return nil, fmt.Errorf("list tracked A records: %w", err)
 	}
@@ -232,6 +233,17 @@ func (s *Store) SetZoneStatus(ctx context.Context, domainID int64, status string
 	if _, err := s.db.ExecContext(ctx,
 		`UPDATE domain SET status = ? WHERE domainID = ?`, status, domainID); err != nil {
 		return fmt.Errorf("set zone status domain %d: %w", domainID, err)
+	}
+	return nil
+}
+
+// SetZoneRegistrar records which registrar manages the domain. sync writes
+// 'cloudflare' for every zone it sees on Cloudflare; update-ip only moves A
+// records of domains whose registrar is 'cloudflare'.
+func (s *Store) SetZoneRegistrar(ctx context.Context, domainID int64, registrar string) error {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE domain SET registrar = ? WHERE domainID = ?`, registrar, domainID); err != nil {
+		return fmt.Errorf("set zone registrar domain %d: %w", domainID, err)
 	}
 	return nil
 }
