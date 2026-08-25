@@ -88,8 +88,8 @@ GLOBAL
 // cmdOpts holds flags parsed from the command line.
 type cmdOpts struct {
 	dryRun, wildcard, yes, proxy, noProxy, all, version bool
-	ttl, prio                                         int
-	typ, content                                      string
+	ttl, prio                                           int
+	typ, content                                        string
 }
 
 // parseOpts splits flag tokens (any position) from positional args.
