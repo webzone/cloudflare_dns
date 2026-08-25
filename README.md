@@ -168,9 +168,73 @@ cfddns zones                  # name / zone id / registrar / status / record cou
 cfddns zones example.com      # detail: registrar, status, record counts, tracked A
 ```
 
-### DNS records
+# --- listing -------------------------------------------------------------
 
-```sh
+cfddns dns example.com              # all live records (type/name/content/
+                                    # ttl/proxy/track)
+cfddns dns example.com --type A     # A records only
+cfddns dns example.com --all        # include soft-disabled (deleted) history
+
+# --- adding ---------------------------------------------------------------
+
+# A record WITHOUT an IP: uses the current public IP, born track=on
+# (it follows home) and proxied by default:
+cfddns dns add example.com A www
+cfddns dns add example.com A 'api.example.com'
+cfddns dns add example.com A '*'    # wildcard — the star MUST be quoted
+
+# A record WITH an explicit IP: the IP is used verbatim and the record is
+# born track=off (it never follows home). If Cloudflare refuses to proxy the
+# target (e.g. a private IP), cfddns falls back to direct automatically:
+cfddns dns add example.com A mail 10.0.0.5
+cfddns dns add example.com A lb 203.0.113.10 --no-proxy
+
+# other types
+cfddns dns add example.com MX @ mail.example.com --prio 10
+cfddns dns add example.com TXT _dmarc "v=DMARC1; p=none"
+cfddns dns add example.com CNAME www.example.net
+cfddns dns add example.com AAAA @ 2001:db8::1   # IPv6 (never auto-proxied)
+
+# --- updating -------------------------------------------------------------
+
+# Name form — fine while the name has a single record:
+cfddns dns update example.com www --content 5.6.7.8
+cfddns dns update example.com www --ttl 300 --no-proxy
+cfddns dns update example.com www --content 5.6.7.8 --prio 10
+# Same-name dual records (two A at the same host): --content is the new
+# value, so it cannot double as a selector — use the Cloudflare record id
+# (shown by the rm picker and in ambiguity errors):
+cfddns dns update example.com 785d22b3a7d0b99cb0c5210dcacc06a1 --content 5.6.7.8
+
+# --- deleting -------------------------------------------------------------
+
+cfddns dns rm example.com www -y    # single record: deletes straight away
+cfddns dns rm example.com @ -y      # APEX = '@'; several records there make
+                                    # the tool list them for selection on a
+                                    # terminal (Enter=1, digit, 'a'=all);
+                                    # without a terminal it errors and names
+                                    # every candidate
+cfddns dns rm example.com @ 10.0.0.5 -y              # pick one by content
+cfddns dns rm example.com '*' --all -y               # delete every record at '*'
+cfddns dns rm example.com e60f5a56209504517b5550de86fdddf1 -y   # by record id
+# Deletes go to Cloudflare first; the local row is soft-disabled afterwards
+# (hidden unless listed with --all). Deleting one of two same-name records
+# leaves the other untouched.
+
+# --- tracking (follow the home IP) -----------------------------------------
+# track=on means "update-ip keeps this record pointing at the current public
+# IP"; track=off leaves the record exactly as it is.
+
+cfddns track example.com on         # every A record of the zone
+cfddns track example.com off
+cfddns track example.com www on     # one record by name (@, *, www, FQDN)
+cfddns track example.com '*' off
+cfddns track example.com @ 10.0.0.5 on   # dual records: disambiguate by content
+# Note: a second A at the same host as a home-IP record can never keep
+# track=on — pointing it home would duplicate the existing record, which
+# Cloudflare forbids (API 81058), so update-ip untracks it again with a
+# warning in the log.
+```
 cfddns dns example.com [--type A] [--all]
 #   live records (type/name/content/ttl/proxy/track); --all includes
 #   soft-disabled history in the local DB
@@ -200,16 +264,12 @@ cfddns dns rm example.com www -y
 ### Automation
 
 ```sh
-cfddns sync                                  # align the local DB with Cloudflare (idempotent)
-cfddns update-ip                             # dynamic DNS + zone reconcile
+cfddns sync              # align the local DB with Cloudflare (idempotent)
+cfddns update-ip         # dynamic DNS + zone reconcile (usually scheduled)
 cfddns init example.com [--wildcard]         # base @/www (+ *) at home IP
-cfddns track example.com on|off              # whole zone follows home IP
-cfddns track example.com www off             # one record (name: @, * or FQDN)
-cfddns track example.com www 15.197.212.58 off
-                                             # same-name dual records:
-                                             # disambiguate by content
 cfddns purge [example.com]                   # edge-cache purge (managed zones)
-cfddns status                                # overview
+cfddns status            # overview: detected IP, token, tracked/excepted counts
+# `track` examples live in the "DNS records" section above.
 ```
 
 ## How it works
