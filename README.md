@@ -4,6 +4,20 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/webzone/cloudflare_dns)](https://goreportcard.com/report/github.com/webzone/cloudflare_dns)
 [![Go Reference](https://pkg.go.dev/badge/github.com/webzone/cloudflare_dns.svg)](https://pkg.go.dev/github.com/webzone/cloudflare_dns)
 
+## Why cfddns?
+
+* **Effortless Dynamic DNS**: Host websites or services on your home server
+  or mobile laptop on the go. Automatically detects your public IP (2-of-3
+  consensus) and keeps your site online wherever you move. Zero IP change =
+  zero API calls.
+* **Batch & Multi-Domain Ready**: Manage, track, and sync DNS records across
+  all your Cloudflare zones with unified, intuitive CLI commands.
+* **Zero Dependencies**: A static, single Go binary with an embedded SQLite
+  state cache—no Docker, MariaDB, or config files required. Run
+  `cfddns token set` and you're set.
+* **Safe & Transparent**: Native `--dry-run` previews, non-destructive soft
+  deletes, and automatic conflict detection for multiple A records.
+
 A single static Go binary with two jobs:
 
 1. **Domain management** — `zones`, `dns` (list/add/update/rm), `track`,
