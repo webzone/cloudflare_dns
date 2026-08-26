@@ -168,98 +168,70 @@ cfddns zones                  # name / zone id / registrar / status / record cou
 cfddns zones example.com      # detail: registrar, status, record counts, tracked A
 ```
 
-# --- listing -------------------------------------------------------------
+### DNS records
 
-cfddns dns example.com              # all live records (type/name/content/
-                                    # ttl/proxy/track)
-cfddns dns example.com --type A     # A records only
-cfddns dns example.com --all        # include soft-disabled (deleted) history
+#### List
 
-# --- adding ---------------------------------------------------------------
+```sh
+cfddns dns example.com               # live records (type/name/content/ttl/proxy/track)
+cfddns dns example.com --type A      # A records only
+cfddns dns example.com --all         # include soft-disabled (deleted) history
+```
 
-# A record WITHOUT an IP: uses the current public IP, born track=on
-# (it follows home) and proxied by default:
-cfddns dns add example.com A www
-cfddns dns add example.com A 'api.example.com'
-cfddns dns add example.com A '*'    # wildcard — the star MUST be quoted
+#### Add
 
-# A record WITH an explicit IP: the IP is used verbatim and the record is
-# born track=off (it never follows home). If Cloudflare refuses to proxy the
-# target (e.g. a private IP), cfddns falls back to direct automatically:
-cfddns dns add example.com A mail 10.0.0.5
+```sh
+cfddns dns add example.com A www             # home IP, track=on, proxied
+cfddns dns add example.com A '*'             # wildcard — quote the star
+cfddns dns add example.com A mail 10.0.0.5   # explicit IP, track=off
 cfddns dns add example.com A lb 203.0.113.10 --no-proxy
-
-# other types
 cfddns dns add example.com MX @ mail.example.com --prio 10
 cfddns dns add example.com TXT _dmarc "v=DMARC1; p=none"
-cfddns dns add example.com CNAME www.example.net
-cfddns dns add example.com AAAA @ 2001:db8::1   # IPv6 (never auto-proxied)
+```
 
-# --- updating -------------------------------------------------------------
+An A record without an IP uses the current public IP and is born `track=on`
+(it follows home, proxied); an explicit IP is used verbatim and born
+`track=off`. A private IP that Cloudflare refuses to proxy falls back to
+direct automatically.
 
-# Name form — fine while the name has a single record:
-cfddns dns update example.com www --content 5.6.7.8
+#### Update
+
+```sh
+cfddns dns update example.com www --content 5.6.7.8            # single-record name
 cfddns dns update example.com www --ttl 300 --no-proxy
-cfddns dns update example.com www --content 5.6.7.8 --prio 10
-# Same-name dual records (two A at the same host): --content is the new
-# value, so it cannot double as a selector — use the Cloudflare record id
-# (shown by the rm picker and in ambiguity errors):
-cfddns dns update example.com 785d22b3a7d0b99cb0c5210dcacc06a1 --content 5.6.7.8
-
-# --- deleting -------------------------------------------------------------
-
-cfddns dns rm example.com www -y    # single record: deletes straight away
-cfddns dns rm example.com @ -y      # APEX = '@'; several records there make
-                                    # the tool list them for selection on a
-                                    # terminal (Enter=1, digit, 'a'=all);
-                                    # without a terminal it errors and names
-                                    # every candidate
-cfddns dns rm example.com @ 10.0.0.5 -y              # pick one by content
-cfddns dns rm example.com '*' --all -y               # delete every record at '*'
-cfddns dns rm example.com e60f5a56209504517b5550de86fdddf1 -y   # by record id
-# Deletes go to Cloudflare first; the local row is soft-disabled afterwards
-# (hidden unless listed with --all). Deleting one of two same-name records
-# leaves the other untouched.
-
-# --- tracking (follow the home IP) -----------------------------------------
-# track=on means "update-ip keeps this record pointing at the current public
-# IP"; track=off leaves the record exactly as it is.
-
-cfddns track example.com on         # every A record of the zone
-cfddns track example.com off
-cfddns track example.com www on     # one record by name (@, *, www, FQDN)
-cfddns track example.com '*' off
-cfddns track example.com @ 10.0.0.5 on   # dual records: disambiguate by content
-# Note: a second A at the same host as a home-IP record can never keep
-# track=on — pointing it home would duplicate the existing record, which
-# Cloudflare forbids (API 81058), so update-ip untracks it again with a
-# warning in the log.
+cfddns dns update example.com <record-id> --content 5.6.7.8    # dual-A names
 ```
-cfddns dns example.com [--type A] [--all]
-#   live records (type/name/content/ttl/proxy/track); --all includes
-#   soft-disabled history in the local DB
 
-cfddns dns add example.com A www [--ttl 300] [--proxy|--no-proxy]
-cfddns dns add example.com A mail 10.0.0.5
-cfddns dns add example.com A '*'             # wildcard: the star MUST be quoted
-cfddns dns add example.com MX @ mail.example.com --prio 10
-cfddns dns add example.com TXT _dmarc "v=DMARC1; p=none"
-#   supported types: A, AAAA, CNAME, MX, TXT. Writes Cloudflare first, then
-#   records them in the local DB. An A record WITHOUT an IP uses the current
-#   public IP and is born track=on (follows home); an explicit IP is used
-#   verbatim and born track=off. The wildcard name is '*' and must be quoted
-#   so the shell does not expand it.
+For a name carrying several records, `--content` is the new value and cannot
+double as a selector; pass the Cloudflare record id instead (shown by the rm
+picker and in ambiguity errors).
 
-cfddns dns update example.com www --content 5.6.7.8 [--ttl 300] [--no-proxy]
-#   change content / ttl / proxy / prio; track flag is preserved
+#### Delete
 
-cfddns dns rm example.com www -y
-#   deletes the record on Cloudflare; the local row is soft-disabled. When
-#   several same-name records match (dual-A), the candidates are listed for
-#   selection — Enter/1 picks the first, 'a' deletes them all, or pass the
-#   content value / record id / --all to skip the prompt.
+```sh
+cfddns dns rm example.com www -y         # single record
+cfddns dns rm example.com @ -y           # apex: several records → pick one
+                                         # (Enter=1, digit, 'a'=all)
+cfddns dns rm example.com @ 10.0.0.5 -y  # pick one of several by content
+cfddns dns rm example.com '*' --all -y   # delete every record at '*'
 ```
+
+Deletes hit Cloudflare first, then soft-disable the local row (hidden from
+later listings unless `--all`).
+
+#### Track
+
+```sh
+cfddns track example.com on              # all A records follow home
+cfddns track example.com www off         # one record (@, *, www or FQDN)
+cfddns track example.com @ 10.0.0.5 on   # dual records: by content
 ```
+
+`track=on` means update-ip keeps the record at the current public IP;
+`track=off` leaves it exactly as it is. A second A at the same host as the
+home-IP record can never stay `track=on` — pointing it home would duplicate
+the existing record (Cloudflare forbids it, API 81058), so update-ip
+untracks it again and logs the reason.
 
 ### Automation
 
